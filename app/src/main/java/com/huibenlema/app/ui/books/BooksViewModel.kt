@@ -1,0 +1,72 @@
+package com.huibenlema.app.ui.books
+
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.viewModelScope
+import com.huibenlema.app.domain.model.Book
+import com.huibenlema.app.domain.repo.BookRepository
+import com.huibenlema.app.domain.repo.ResyncPriceResult
+import dagger.hilt.android.lifecycle.HiltViewModel
+import javax.inject.Inject
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.launch
+
+enum class BookSort { VALUE, PROGRESS, PRICE }
+
+/** 排序状态：再次点击同一维度切换升/降序 */
+data class SortState(val key: BookSort, val ascending: Boolean)
+
+@HiltViewModel
+class BooksViewModel @Inject constructor(
+    private val repo: BookRepository
+) : ViewModel() {
+
+    private val sort = MutableStateFlow(SortState(BookSort.VALUE, ascending = false))
+
+    val books: StateFlow<List<Book>> =
+        combine(repo.observeShelfBooks(), sort) { list, s ->
+            val sorted = when (s.key) {
+                BookSort.VALUE -> list.sortedBy { it.contributedFen }
+                BookSort.PROGRESS -> list.sortedBy { it.progress }
+                BookSort.PRICE -> list.sortedBy { it.priceFen }
+            }
+            if (s.ascending) sorted else sorted.reversed()
+        }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
+
+    val sortState: StateFlow<SortState> = sort.asStateFlow()
+
+    /** 书值总价值（全部书架书籍的贡献价值合计） */
+    val totalValueFen: StateFlow<Long> = repo.observeSummary()
+        .map { it.totalValueFen }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), 0L)
+
+    /** 点击排序片：同维度切换升/降序，异维度切换为新维度（默认降序） */
+    fun toggleSort(key: BookSort) {
+        val cur = sort.value
+        sort.value = if (cur.key == key) cur.copy(ascending = !cur.ascending)
+        else SortState(key, ascending = false)
+    }
+
+    /**
+     * 保存定价：isOfficial = 官方同步价未修改 → WEREAD；
+     * 否则按手动价处理（MANUAL 优先级最高，自动同步不覆盖）。
+     */
+    fun savePrice(book: Book, priceYuan: String, isOfficial: Boolean) {
+        val fen = ((priceYuan.toDoubleOrNull() ?: return).times(100)).toLong()
+        if (fen < 0) return
+        viewModelScope.launch {
+            if (isOfficial) repo.saveOfficialPrice(book.bookId, fen)
+            else repo.updatePriceManual(book.bookId, fen)
+        }
+    }
+
+    /** 重新同步微信读书官方价格（强制覆盖手动价），结果经回调返回 */
+    fun resyncOfficialPrice(book: Book, onResult: (ResyncPriceResult) -> Unit) {
+        viewModelScope.launch { onResult(repo.resyncOfficialPrice(book.bookId)) }
+    }
+}

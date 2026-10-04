@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 墨水屏友好：纯白窗口背景、无 ActionBar，UI 由 Compose 接管 -->
+    <style name="Theme.HuiBenLeMa" parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:windowBackground">@android:color/white</item>
+    </style>
+</resources>

@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  应用图标（黑白墨水屏风格）：
+  黑底圆角方块 + 白色翻开的书 + 书页中央黑色 ¥（阅读价值）
+  + 底部回本进度条（灰槽白填充，约 55%，即"回本进行中"）。
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- 背景：黑色圆角方块 -->
+    <path
+        android:fillColor="#111111"
+        android:pathData="M22,2 h64 a22,22 0 0 1 22,22 v60 a22,22 0 0 1 -22,22 h-64 a22,22 0 0 1 -22,-22 v-60 a22,22 0 0 1 22,-22 z" />
+    <!-- 翻开的书（白色） -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M54,30c-7,-3.5 -15.5,-5.5 -25,-5.5c-3,0 -6,0.3 -9,0.9v46c3,-0.6 6,-0.9 9,-0.9c9.5,0 18,2 25,5.5z" />
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M54,30c7,-3.5 15.5,-5.5 25,-5.5c3,0 6,0.3 9,0.9v46c-3,-0.6 -6,-0.9 -9,-0.9c-9.5,0 -18,2 -25,5.5z" />
+    <!-- ¥ 符号（黑色，书页中央） -->
+    <path
+        android:strokeColor="#111111"
+        android:strokeWidth="3.2"
+        android:strokeLineCap="round"
+        android:pathData="M45,50 H63" />
+    <path
+        android:strokeColor="#111111"
+        android:strokeWidth="3.2"
+        android:strokeLineCap="round"
+        android:pathData="M48,57 H60" />
+    <path
+        android:strokeColor="#111111"
+        android:strokeWidth="3.2"
+        android:strokeLineCap="round"
+        android:pathData="M54,44 V63" />
+    <path
+        android:strokeColor="#111111"
+        android:strokeWidth="3.2"
+        android:strokeLineCap="round"
+        android:pathData="M49,38 L54,48 M59,38 L54,48" />
+    <!-- 回本进度条：灰槽 + 白色填充（约 55%） -->
+    <path
+        android:strokeColor="#555555"
+        android:strokeWidth="5"
+        android:strokeLineCap="round"
+        android:pathData="M28,93 H80" />
+    <path
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="5"
+        android:strokeLineCap="round"
+        android:pathData="M28,93 H56" />
+</vector>

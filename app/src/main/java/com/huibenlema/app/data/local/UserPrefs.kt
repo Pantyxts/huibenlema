@@ -35,6 +35,8 @@ class UserPrefs @Inject constructor(@ApplicationContext private val context: Con
         val ACCOUNT_NAME = stringPreferencesKey("account_name")
         val ACCOUNT_VID = stringPreferencesKey("account_vid")
         val COST_CATEGORIES = stringSetPreferencesKey("cost_categories")
+        val LAST_UPDATE_CHECK_AT = longPreferencesKey("last_update_check_at")
+        val PENDING_UPDATE_VERSION = stringPreferencesKey("pending_update_version")
     }
 
     val apiKeyCipher: Flow<String?> = context.dataStore.data.map { it[Keys.API_KEY_CIPHER] }
@@ -49,6 +51,8 @@ class UserPrefs @Inject constructor(@ApplicationContext private val context: Con
     val accountVid: Flow<String?> = context.dataStore.data.map { it[Keys.ACCOUNT_VID] }
     val customCostCategories: Flow<Set<String>> =
         context.dataStore.data.map { it[Keys.COST_CATEGORIES] ?: emptySet() }
+    val lastUpdateCheckAt: Flow<Long> = context.dataStore.data.map { it[Keys.LAST_UPDATE_CHECK_AT] ?: 0L }
+    val pendingUpdateVersion: Flow<String?> = context.dataStore.data.map { it[Keys.PENDING_UPDATE_VERSION] }
 
     suspend fun setApiKeyCipher(value: String?) {
         context.dataStore.edit { p ->
@@ -109,6 +113,16 @@ class UserPrefs @Inject constructor(@ApplicationContext private val context: Con
         context.dataStore.edit { p ->
             val cur = p[Keys.COST_CATEGORIES] ?: emptySet()
             p[Keys.COST_CATEGORIES] = cur - name
+        }
+    }
+
+    suspend fun setLastUpdateCheckAt(value: Long) {
+        context.dataStore.edit { it[Keys.LAST_UPDATE_CHECK_AT] = value }
+    }
+
+    suspend fun setPendingUpdateVersion(value: String?) {
+        context.dataStore.edit { p ->
+            if (value == null) p.remove(Keys.PENDING_UPDATE_VERSION) else p[Keys.PENDING_UPDATE_VERSION] = value
         }
     }
 }

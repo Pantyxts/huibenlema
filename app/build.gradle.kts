@@ -25,7 +25,7 @@ android {
         minSdk = 23
         targetSdk = 35
         versionCode = 1
-        versionName = "1.0.3"
+        versionName = "1.0.4"
     }
 
     // 双变体：eink = 墨水屏版（先做），universal = 通用手机版（阶段 3）
@@ -36,7 +36,7 @@ android {
             // 兼容旧墨水屏（targetSdk<=28 + 32 位 ABI）；掌阅 Neo3 Ultra（安卓14）跑 arm64 切片
             targetSdk = 28
             // ⚠️ 每次发版必须递增！Android 按 versionCode 判断"已安装该版本"
-            versionCode = 101008
+            versionCode = 101009
             ndk {
                 abiFilters += listOf("arm64-v8a", "armeabi-v7a")
             }

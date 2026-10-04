@@ -60,6 +60,10 @@ class HomeViewModel @Inject constructor(
     val lastSyncAt: StateFlow<Long> = repo.observeLastSyncAt()
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), 0L)
 
+    /** 启动自动检查发现的新版本（首页横幅提示） */
+    val pendingUpdateVersion: StateFlow<String?> = prefs.pendingUpdateVersion
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), null)
+
     val hasCredential: StateFlow<Boolean> = repo.observeHasCredential()
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), false)
 

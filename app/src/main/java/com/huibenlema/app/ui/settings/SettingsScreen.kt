@@ -29,6 +29,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -38,11 +39,13 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.huibenlema.app.BuildConfig
+import com.huibenlema.app.data.update.UpdateManager
 import com.huibenlema.app.domain.model.CostCategory
 import com.huibenlema.app.domain.model.CostItem
 import com.huibenlema.app.domain.model.displayName
@@ -69,6 +72,10 @@ fun SettingsScreen(vm: SettingsViewModel = hiltViewModel()) {
     val accountName by vm.accountName.collectAsStateWithLifecycle()
     val accountVid by vm.accountVid.collectAsStateWithLifecycle()
     val customCategories by vm.customCategories.collectAsStateWithLifecycle()
+    val updateState by vm.updateState.collectAsStateWithLifecycle()
+
+    // 进入设置页即清除首页"发现新版本"横幅
+    LaunchedEffect(Unit) { vm.clearPendingUpdate() }
 
     // 数据导出：系统文件选择器（SAF），零存储权限
     val exportLauncher = rememberLauncherForActivityResult(
@@ -273,6 +280,13 @@ fun SettingsScreen(vm: SettingsViewModel = hiltViewModel()) {
                 Text("GitHub：github.com/Pantyxts/huibenlema", style = MaterialTheme.typography.bodySmall, color = GrayDark)
                 Text("小红书号：2227368465", style = MaterialTheme.typography.bodySmall, color = GrayDark)
                 Text("问题反馈邮箱：panty314159@163.com", style = MaterialTheme.typography.bodySmall, color = GrayDark)
+                Spacer(Modifier.height(4.dp))
+                TextButton(
+                    onClick = vm::checkUpdate,
+                    enabled = updateState !is UpdateManager.UpdateState.Checking
+                ) {
+                    Text(if (updateState is UpdateManager.UpdateState.Checking) "检查更新中…" else "检查更新")
+                }
             }
         }
         Spacer(Modifier.height(24.dp))
@@ -312,6 +326,91 @@ fun SettingsScreen(vm: SettingsViewModel = hiltViewModel()) {
         ) {
             Text("书籍按合并处理；成本台账与每日统计将被备份文件覆盖。")
         }
+    }
+    // ---- 自动更新对话框 ----
+    when (val st = updateState) {
+        is UpdateManager.UpdateState.Available -> {
+            EinkDialog(
+                onDismissRequest = vm::dismissUpdate,
+                title = "发现新版本 v${st.info.versionName}",
+                confirmText = "下载更新",
+                onConfirm = vm::downloadUpdate
+            ) {
+                Text(
+                    st.info.releaseNotes.ifBlank { "新版本已发布，建议下载更新。" },
+                    style = MaterialTheme.typography.bodySmall,
+                    maxLines = 8,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+        }
+        is UpdateManager.UpdateState.Downloading -> {
+            Dialog(onDismissRequest = vm::dismissUpdate) {
+                Surface(
+                    shape = RoundedCornerShape(12.dp),
+                    color = Color.White,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .border(2.dp, InkBlack, RoundedCornerShape(12.dp))
+                ) {
+                    Column(Modifier.padding(20.dp)) {
+                        Text("正在下载更新", style = MaterialTheme.typography.titleMedium)
+                        Spacer(Modifier.height(12.dp))
+                        Text("${st.percent}%", style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Bold)
+                        Spacer(Modifier.height(4.dp))
+                        Box(
+                            Modifier
+                                .fillMaxWidth()
+                                .height(8.dp)
+                                .background(GrayLight)
+                        ) {
+                            Box(
+                                Modifier
+                                    .fillMaxWidth(fraction = st.percent / 100f)
+                                    .fillMaxHeight()
+                                    .background(InkBlack)
+                            )
+                        }
+                        Spacer(Modifier.height(12.dp))
+                        TextButton(
+                            onClick = vm::dismissUpdate,
+                            modifier = Modifier.align(Alignment.End)
+                        ) {
+                            Text("取消", color = GrayDark)
+                        }
+                    }
+                }
+            }
+        }
+        is UpdateManager.UpdateState.Downloaded -> {
+            EinkDialog(
+                onDismissRequest = vm::dismissUpdate,
+                title = "下载完成",
+                confirmText = "立即安装",
+                onConfirm = vm::installUpdate
+            ) {
+                Text("新版本已下载完成，安装完成后即可使用。")
+            }
+        }
+        is UpdateManager.UpdateState.Failed -> {
+            EinkDialog(
+                onDismissRequest = vm::dismissUpdate,
+                title = "更新失败",
+                confirmText = "知道了",
+                onConfirm = vm::dismissUpdate
+            ) {
+                Text(st.message)
+            }
+        }
+        is UpdateManager.UpdateState.NoUpdate -> {
+            EinkDialog(
+                onDismissRequest = vm::dismissUpdate,
+                title = "已是最新版本",
+                confirmText = "知道了",
+                onConfirm = vm::dismissUpdate
+            ) {}
+        }
+        else -> {}
     }
     // 退出登录确认
     if (vm.showLogoutConfirm) {

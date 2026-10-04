@@ -11,6 +11,7 @@ import com.huibenlema.app.data.local.UserPrefs
 import com.huibenlema.app.data.security.CredentialsManager
 import com.huibenlema.app.data.sync.AutoSyncScheduler
 import com.huibenlema.app.data.sync.SyncProgress
+import com.huibenlema.app.data.update.UpdateManager
 import com.huibenlema.app.domain.model.CostCategory
 import com.huibenlema.app.domain.model.CostItem
 import com.huibenlema.app.domain.repo.BookRepository
@@ -33,8 +34,36 @@ class SettingsViewModel @Inject constructor(
     private val credentials: CredentialsManager,
     private val prefs: UserPrefs,
     private val db: AppDatabase,
-    private val autoSyncScheduler: AutoSyncScheduler
+    private val autoSyncScheduler: AutoSyncScheduler,
+    private val updateManager: UpdateManager
 ) : ViewModel() {
+
+    // ---- 自动更新 ----
+
+    val updateState = updateManager.state
+
+    fun checkUpdate() {
+        viewModelScope.launch { updateManager.checkUpdate() }
+    }
+
+    fun downloadUpdate() {
+        val st = updateState.value as? UpdateManager.UpdateState.Available ?: return
+        viewModelScope.launch { updateManager.download(st.info) }
+    }
+
+    fun installUpdate() {
+        val st = updateState.value as? UpdateManager.UpdateState.Downloaded ?: return
+        updateManager.install(st.file)
+    }
+
+    fun dismissUpdate() {
+        updateManager.reset()
+    }
+
+    /** 进入设置页后清除首页"发现新版本"横幅 */
+    fun clearPendingUpdate() {
+        viewModelScope.launch { prefs.setPendingUpdateVersion(null) }
+    }
 
     val costItems: StateFlow<List<CostItem>> = repo.observeCostItems()
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())

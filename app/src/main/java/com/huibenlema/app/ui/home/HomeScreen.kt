@@ -55,6 +55,7 @@ fun HomeScreen(
     onGoSettings: () -> Unit
 ) {
     val summary by vm.summary.collectAsStateWithLifecycle()
+    val pendingUpdate by vm.pendingUpdateVersion.collectAsStateWithLifecycle()
     val dailyStats by vm.dailyStats.collectAsStateWithLifecycle()
     val lastSyncAt by vm.lastSyncAt.collectAsStateWithLifecycle()
     val hasCredential by vm.hasCredential.collectAsStateWithLifecycle()
@@ -89,6 +90,11 @@ fun HomeScreen(
 
         if (!hasCredential) {
             Banner("尚未登录微信读书，点击去「设置 → 登录信息」扫码登录", onClick = onGoSettings)
+            Spacer(Modifier.height(12.dp))
+        }
+
+        pendingUpdate?.let {
+            Banner("发现新版本 v$it，点击去「设置」更新", onClick = onGoSettings)
             Spacer(Modifier.height(12.dp))
         }
 

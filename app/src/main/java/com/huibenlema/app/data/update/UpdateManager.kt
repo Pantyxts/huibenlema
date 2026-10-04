@@ -43,7 +43,15 @@ class UpdateManager @Inject constructor(
         data object Checking : UpdateState()
         data class Available(val info: UpdateInfo) : UpdateState()
         data object NoUpdate : UpdateState()
-        data class Downloading(val percent: Int) : UpdateState()
+        /** 正在连接下载服务器（含切换镜像重试） */
+        data object Connecting : UpdateState()
+        data class Downloading(
+            /** 百分比 0-100；未知大小（无 Content-Length）时为 -1 */
+            val percent: Int,
+            val downloadedBytes: Long,
+            val totalBytes: Long,
+            val speedBytesPerSec: Long
+        ) : UpdateState()
         data class Downloaded(val file: File) : UpdateState()
         data class Failed(val message: String) : UpdateState()
     }
@@ -100,43 +108,64 @@ class UpdateManager @Inject constructor(
         }
     }
 
-    /** 下载 APK 到应用私有目录（进度写入 state） */
+    /**
+     * 下载 APK 到应用私有目录（进度写入 state）。
+     * 官方地址优先；国内网络不通时自动切换加速镜像重试。
+     */
     suspend fun download(info: UpdateInfo): File? = withContext(Dispatchers.IO) {
-        try {
-            val dir = File(context.filesDir, "downloads").apply { mkdirs() }
-            val file = File(dir, "huibenlema-v${info.versionName}.apk")
-            val req = Request.Builder().url(info.downloadUrl).build()
-            client.newCall(req).execute().use { resp ->
-                if (!resp.isSuccessful) {
-                    _state.value = UpdateState.Failed("下载失败：HTTP ${resp.code}")
-                    return@withContext null
-                }
-                val body = resp.body ?: run {
-                    _state.value = UpdateState.Failed("下载失败：空响应")
-                    return@withContext null
-                }
-                val total = body.contentLength()
-                file.outputStream().use { out ->
-                    val input = body.byteStream()
-                    val buf = ByteArray(64 * 1024)
-                    var read = 0L
-                    while (true) {
-                        val n = input.read(buf)
-                        if (n < 0) break
-                        out.write(buf, 0, n)
-                        read += n
-                        if (total > 0) {
-                            _state.value = UpdateState.Downloading(((read * 100) / total).toInt().coerceIn(0, 100))
+        val urls = buildList {
+            add(info.downloadUrl)
+            // 国内加速镜像（ghproxy 类；签名校验兜底安全，篡改包无法通过系统签名验证）
+            add("https://ghfast.top/" + info.downloadUrl)
+            add("https://gh-proxy.com/" + info.downloadUrl)
+        }
+        val dir = File(context.filesDir, "downloads").apply { mkdirs() }
+        val file = File(dir, "huibenlema-v${info.versionName}.apk")
+        var lastError: Exception? = null
+        for (url in urls) {
+            try {
+                _state.value = UpdateState.Connecting
+                val req = Request.Builder().url(url).build()
+                client.newCall(req).execute().use { resp ->
+                    if (!resp.isSuccessful) throw java.io.IOException("HTTP ${resp.code}")
+                    val body = resp.body ?: throw java.io.IOException("空响应")
+                    val total = body.contentLength()
+                    file.outputStream().use { out ->
+                        val input = body.byteStream()
+                        val buf = ByteArray(64 * 1024)
+                        var read = 0L
+                        var lastSampleAt = 0L
+                        var lastSampleRead = 0L
+                        while (true) {
+                            val n = input.read(buf)
+                            if (n < 0) break
+                            out.write(buf, 0, n)
+                            read += n
+                            // 每 500ms 采样一次速度并刷新进度
+                            val now = System.currentTimeMillis()
+                            if (now - lastSampleAt >= 500) {
+                                val speed = if (lastSampleAt > 0) (read - lastSampleRead) * 1000 / (now - lastSampleAt) else 0L
+                                lastSampleAt = now
+                                lastSampleRead = read
+                                _state.value = UpdateState.Downloading(
+                                    percent = if (total > 0) ((read * 100) / total).toInt().coerceIn(0, 100) else -1,
+                                    downloadedBytes = read,
+                                    totalBytes = total,
+                                    speedBytesPerSec = speed
+                                )
+                            }
                         }
                     }
                 }
+                _state.value = UpdateState.Downloaded(file)
+                return@withContext file
+            } catch (e: Exception) {
+                lastError = e
+                // 当前地址失败，尝试下一个镜像
             }
-            _state.value = UpdateState.Downloaded(file)
-            file
-        } catch (e: Exception) {
-            _state.value = UpdateState.Failed("下载失败：${e.message ?: "网络错误"}")
-            null
         }
+        _state.value = UpdateState.Failed("下载失败：${lastError?.message ?: "网络错误"}")
+        null
     }
 
     /** 拉起系统安装器（需要用户已允许"安装未知应用"） */

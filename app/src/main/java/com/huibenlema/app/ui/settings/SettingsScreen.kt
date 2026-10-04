@@ -52,6 +52,7 @@ import com.huibenlema.app.domain.model.displayName
 import com.huibenlema.app.ui.components.EinkButton
 import com.huibenlema.app.ui.components.EinkChip
 import com.huibenlema.app.ui.components.EinkDialog
+import com.huibenlema.app.ui.components.formatBytes
 import com.huibenlema.app.ui.components.formatFen
 import com.huibenlema.app.ui.components.formatSyncTime
 import com.huibenlema.app.ui.login.LoginScreen
@@ -351,6 +352,34 @@ fun SettingsScreen(vm: SettingsViewModel = hiltViewModel()) {
                 )
             }
         }
+        is UpdateManager.UpdateState.Connecting -> {
+            Dialog(onDismissRequest = vm::dismissUpdate) {
+                Surface(
+                    shape = RoundedCornerShape(12.dp),
+                    color = Color.White,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .border(2.dp, InkBlack, RoundedCornerShape(12.dp))
+                ) {
+                    Column(Modifier.padding(20.dp)) {
+                        Text("正在连接下载服务器…", style = MaterialTheme.typography.titleMedium)
+                        Spacer(Modifier.height(8.dp))
+                        Text(
+                            "连接失败会自动切换加速通道重试",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = GrayDark
+                        )
+                        Spacer(Modifier.height(12.dp))
+                        TextButton(
+                            onClick = vm::dismissUpdate,
+                            modifier = Modifier.align(Alignment.End)
+                        ) {
+                            Text("取消", color = GrayDark)
+                        }
+                    }
+                }
+            }
+        }
         is UpdateManager.UpdateState.Downloading -> {
             Dialog(onDismissRequest = vm::dismissUpdate) {
                 Surface(
@@ -363,7 +392,21 @@ fun SettingsScreen(vm: SettingsViewModel = hiltViewModel()) {
                     Column(Modifier.padding(20.dp)) {
                         Text("正在下载更新", style = MaterialTheme.typography.titleMedium)
                         Spacer(Modifier.height(12.dp))
-                        Text("${st.percent}%", style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Bold)
+                        Text(
+                            if (st.percent >= 0) "${st.percent}%" else "下载中…",
+                            style = MaterialTheme.typography.bodyMedium,
+                            fontWeight = FontWeight.Bold
+                        )
+                        Spacer(Modifier.height(2.dp))
+                        Text(
+                            buildString {
+                                append(formatBytes(st.downloadedBytes))
+                                if (st.totalBytes > 0) append(" / ${formatBytes(st.totalBytes)}")
+                                if (st.speedBytesPerSec > 0) append(" · ${formatBytes(st.speedBytesPerSec)}/s")
+                            },
+                            style = MaterialTheme.typography.bodySmall,
+                            color = GrayDark
+                        )
                         Spacer(Modifier.height(4.dp))
                         Box(
                             Modifier
@@ -373,7 +416,7 @@ fun SettingsScreen(vm: SettingsViewModel = hiltViewModel()) {
                         ) {
                             Box(
                                 Modifier
-                                    .fillMaxWidth(fraction = st.percent / 100f)
+                                    .fillMaxWidth(fraction = (st.percent.coerceAtLeast(0) / 100f))
                                     .fillMaxHeight()
                                     .background(InkBlack)
                             )

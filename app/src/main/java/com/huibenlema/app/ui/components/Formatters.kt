@@ -45,3 +45,10 @@ fun formatCnDate(dateStr: String): String =
 fun formatRegistDate(epochSeconds: Long): String =
     Instant.ofEpochSecond(epochSeconds).atZone(ZoneId.systemDefault())
         .format(DateTimeFormatter.ofPattern("yyyy年M月d日"))
+
+/** 字节数 → "1.9MB" / "256KB" / "512B" */
+fun formatBytes(bytes: Long): String = when {
+    bytes >= 1024 * 1024 -> String.format("%.1fMB", bytes / 1024.0 / 1024.0)
+    bytes >= 1024 -> String.format("%.0fKB", bytes / 1024.0)
+    else -> "${bytes}B"
+}

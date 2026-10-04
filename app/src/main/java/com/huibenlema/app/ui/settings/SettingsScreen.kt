@@ -275,17 +275,24 @@ fun SettingsScreen(vm: SettingsViewModel = hiltViewModel()) {
             colors = CardDefaults.cardColors(containerColor = Color.White)
         ) {
             Column(Modifier.padding(12.dp)) {
-                Text("回本了吗 v${BuildConfig.VERSION_NAME}", style = MaterialTheme.typography.bodyMedium)
-                Text("开发者：Panty", style = MaterialTheme.typography.bodySmall, color = GrayDark)
-                Text("GitHub：github.com/Pantyxts/huibenlema", style = MaterialTheme.typography.bodySmall, color = GrayDark)
-                Text("小红书号：2227368465", style = MaterialTheme.typography.bodySmall, color = GrayDark)
-                Text("问题反馈邮箱：panty314159@163.com", style = MaterialTheme.typography.bodySmall, color = GrayDark)
-                Spacer(Modifier.height(4.dp))
-                TextButton(
-                    onClick = vm::checkUpdate,
-                    enabled = updateState !is UpdateManager.UpdateState.Checking
+                Row(
+                    Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Text(if (updateState is UpdateManager.UpdateState.Checking) "检查更新中…" else "检查更新")
+                    Column(Modifier.weight(1f)) {
+                        Text("回本了吗 v${BuildConfig.VERSION_NAME}", style = MaterialTheme.typography.bodyMedium)
+                        Text("开发者：Panty", style = MaterialTheme.typography.bodySmall, color = GrayDark)
+                        Text("小红书号：2227368465", style = MaterialTheme.typography.bodySmall, color = GrayDark)
+                        Text("问题反馈邮箱：panty314159@163.com", style = MaterialTheme.typography.bodySmall, color = GrayDark)
+                        Text("GitHub：github.com/Pantyxts/huibenlema", style = MaterialTheme.typography.bodySmall, color = GrayDark)
+                    }
+                    TextButton(
+                        onClick = vm::checkUpdate,
+                        enabled = updateState !is UpdateManager.UpdateState.Checking
+                    ) {
+                        Text(if (updateState is UpdateManager.UpdateState.Checking) "检查中…" else "检查更新")
+                    }
                 }
             }
         }

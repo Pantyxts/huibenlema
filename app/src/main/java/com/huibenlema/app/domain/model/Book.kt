@@ -23,9 +23,13 @@ data class Book(
     /** 累计阅读时长（秒） */
     val totalReadSeconds: Long = 0L,
     val lastReadAt: Long = 0L,
+    /** 进度是否手动调节过（列表进度百分比后显示「（手动）」） */
+    val progressManual: Boolean = false,
     val onShelf: Boolean = true,
     /** 已移出书架（读完移除/下架）；有进度的移出书仍计入价值 */
-    val removed: Boolean = false
+    val removed: Boolean = false,
+    /** 用户手动隐藏：不参与价值/回本等一切计算，仅隐藏列表可见 */
+    val hidden: Boolean = false
 ) {
     /** 本书贡献价值（分）= 进度 × 定价 */
     val contributedFen: Long

@@ -27,9 +27,13 @@ data class BookEntity(
     val lastReadAt: Long = 0L,
     /** 最近一次拉取进度的时间（增量同步：远端 readUpdateTime 超过它才重新拉） */
     val progressFetchedAt: Long = 0L,
+    /** 进度是否手动调节过（书值页显示「（手动）」标记；同步取较长者，被远端覆盖时清除） */
+    val progressManual: Boolean = false,
     val onShelf: Boolean = true,
     /** 软删除（下架/移出书架） */
     val removed: Boolean = false,
+    /** 用户手动隐藏：不参与价值/回本等一切计算，书值页仅隐藏列表可见 */
+    val hidden: Boolean = false,
     val createdAt: Long = 0L,
     val updatedAt: Long = 0L
 )

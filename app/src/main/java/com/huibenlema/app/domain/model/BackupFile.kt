@@ -26,7 +26,11 @@ data class BackupBook(
     val progress: Double = 0.0,
     val totalReadSeconds: Long = 0L,
     val onShelf: Boolean = true,
-    val removed: Boolean = false
+    val removed: Boolean = false,
+    /** 用户手动隐藏（旧备份无此字段，默认 false） */
+    val hidden: Boolean = false,
+    /** 进度手动调节标记（旧备份无此字段，默认 false） */
+    val progressManual: Boolean = false
 )
 
 @Serializable

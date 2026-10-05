@@ -12,12 +12,14 @@ import com.huibenlema.app.ui.components.PieSlice
 import com.huibenlema.app.ui.components.formatFen
 import dagger.hilt.android.lifecycle.HiltViewModel
 import javax.inject.Inject
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
@@ -47,10 +49,9 @@ class HomeViewModel @Inject constructor(
             repo.lastSyncResult.collect { r ->
                 _message.value = when (r) {
                     is SyncResult.Success -> buildString {
-                        append("共导入书籍 ${r.bookCount} 本，获取价格成功 ${r.pricedCount} 本，" +
-                            "获取价格失败 ${r.unpricedCount} 本")
-                        append("\n（自导入书籍无官方价格，显示为 0 元）")
+                        append("共导入书籍 ${r.bookCount} 本，获取价格成功 ${r.pricedCount} 本")
                         r.priceWarning?.let { append("\n$it") }
+                        append("\n自导入书籍无官方价格，显示为 0 元")
                     }
                     SyncResult.NoCredential -> "尚未登录，请到「设置 → 登录信息」扫码登录"
                     SyncResult.AuthFailed -> "凭证已失效，请重新扫码登录"
@@ -107,7 +108,9 @@ class HomeViewModel @Inject constructor(
         val top = sorted.take(4).map { PieSlice(it.title, it.contributedFen) }
         val rest = sorted.drop(4).sumOf { it.contributedFen }
         if (rest > 0) top + PieSlice("其他书籍", rest) else top
-    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
+        // 万本量级排序放 Default 线程，避免同步时阻塞主线程
+    }.flowOn(Dispatchers.Default)
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
 
     private val _selectedDay = MutableStateFlow<String?>(null)
     val selectedDay: StateFlow<String?> = _selectedDay.asStateFlow()
@@ -125,7 +128,8 @@ class HomeViewModel @Inject constructor(
             val dailySec = daily.sumOf { it.readSeconds }
             val seconds = maxOf(bookSec, dailySec)
             if (summary != null && seconds > 0) summary.totalValueFen * 3600 / seconds else 0L
-        }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), 0L)
+        }.flowOn(Dispatchers.Default)
+            .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), 0L)
 
     /** 同步进行中（全局状态：引导页后台同步、手动同步、自动同步均反映） */
     val syncing: StateFlow<Boolean> = repo.syncing

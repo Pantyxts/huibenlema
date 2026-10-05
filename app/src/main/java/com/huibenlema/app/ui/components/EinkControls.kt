@@ -70,12 +70,14 @@ fun EinkButton(
 
 /**
  * 墨水屏筛选片：选中 = 浅灰底 + 黑粗边框 + 加粗；按下时黑色反转。
+ * [whiteSelected] = true 时选中态保持白底黑字（书值页多选/筛选/批量操作按钮用，不要灰底）。
  */
 @Composable
 fun EinkChip(
     label: String,
     selected: Boolean,
     modifier: Modifier = Modifier,
+    whiteSelected: Boolean = false,
     onClick: () -> Unit
 ) {
     val interactionSource = remember { MutableInteractionSource() }
@@ -88,6 +90,7 @@ fun EinkChip(
             .background(
                 when {
                     invert -> InkBlack
+                    selected && whiteSelected -> Color.White
                     selected -> GrayLight
                     else -> Color.White
                 },

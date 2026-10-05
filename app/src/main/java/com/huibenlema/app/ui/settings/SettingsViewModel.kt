@@ -12,6 +12,7 @@ import com.huibenlema.app.data.security.CredentialsManager
 import com.huibenlema.app.data.sync.AutoSyncScheduler
 import com.huibenlema.app.data.sync.SyncProgress
 import com.huibenlema.app.data.update.UpdateManager
+import com.huibenlema.app.domain.model.Book
 import com.huibenlema.app.domain.model.CostCategory
 import com.huibenlema.app.domain.model.CostItem
 import com.huibenlema.app.domain.repo.BookRepository
@@ -44,10 +45,9 @@ class SettingsViewModel @Inject constructor(
             repo.lastSyncResult.collect { r ->
                 message = when (r) {
                     is SyncResult.Success -> buildString {
-                        append("共导入书籍 ${r.bookCount} 本，获取价格成功 ${r.pricedCount} 本，" +
-                            "获取价格失败 ${r.unpricedCount} 本")
-                        append("\n（自导入书籍无官方价格，显示为 0 元）")
+                        append("共导入书籍 ${r.bookCount} 本，获取价格成功 ${r.pricedCount} 本")
                         r.priceWarning?.let { append("\n$it") }
+                        append("\n自导入书籍无官方价格，显示为 0 元")
                     }
                     SyncResult.NoCredential -> "尚未登录，请先扫码登录"
                     SyncResult.AuthFailed -> "凭证已失效，请重新扫码登录"
@@ -135,6 +135,15 @@ class SettingsViewModel @Inject constructor(
 
     val lastSyncAt: StateFlow<Long> = repo.observeLastSyncAt()
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), 0L)
+
+    /** 用户手动隐藏的书籍（设置-数据-隐藏书籍入口展示） */
+    val hiddenBooks: StateFlow<List<Book>> = repo.observeHiddenBooks()
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
+
+    /** 隐藏书籍移出隐藏（恢复显示，重新参与价值计算） */
+    fun restoreHidden(bookIds: List<String>) {
+        viewModelScope.launch { repo.setBooksHidden(bookIds, hidden = false) }
+    }
 
     val autoSync: StateFlow<Boolean> = prefs.autoSync
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), false)

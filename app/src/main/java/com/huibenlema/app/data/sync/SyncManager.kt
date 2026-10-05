@@ -1,5 +1,7 @@
 package com.huibenlema.app.data.sync
 
+import androidx.room.withTransaction
+import com.huibenlema.app.data.local.AppDatabase
 import com.huibenlema.app.data.local.UserPrefs
 import com.huibenlema.app.data.local.dao.BookDao
 import com.huibenlema.app.data.local.dao.DailyBookStatDao
@@ -17,11 +19,16 @@ import com.huibenlema.app.data.remote.GatewayResult
 import com.huibenlema.app.data.remote.LongestBookDto
 import com.huibenlema.app.data.remote.OfficialGatewayClient
 import com.huibenlema.app.data.remote.PrivateWereadApi
+import com.huibenlema.app.data.remote.ProgressDto
+import com.huibenlema.app.data.remote.ShelfSyncDto
 import com.huibenlema.app.data.remote.lng
 import com.huibenlema.app.data.remote.priceFenOrNull
 import com.huibenlema.app.data.remote.str
 import com.huibenlema.app.domain.model.PriceSource
+import com.huibenlema.app.domain.repo.BatchPriceResult
+import com.huibenlema.app.domain.repo.BatchProgressResult
 import com.huibenlema.app.domain.repo.ResyncPriceResult
+import com.huibenlema.app.domain.repo.ResyncProgressResult
 import com.huibenlema.app.domain.repo.SyncResult
 import java.time.LocalDate
 import java.time.ZoneId
@@ -42,6 +49,7 @@ import kotlinx.serialization.json.longOrNull
  */
 @Singleton
 class SyncManager @Inject constructor(
+    private val db: AppDatabase,
     private val client: OfficialGatewayClient,
     private val privateApi: PrivateWereadApi,
     private val bookDao: BookDao,
@@ -77,11 +85,14 @@ class SyncManager @Inject constructor(
     }
 
     private suspend fun doSync(key: String, cookie: String?, now: Long): SyncResult {
-        // 1. 书架
-        val shelf = when (val r = client.shelfSync(key)) {
+        // 1. 书架（限流时退避重试，避免上千本书同步被风控时整次失败）
+        val shelf = when (val r = shelfSyncWithRetry(key)) {
             is GatewayResult.Ok -> r.data
-            is GatewayResult.Err -> return if (r.errcode == -1) SyncResult.NetworkError
-            else SyncResult.Failure(r.message)
+            is GatewayResult.Err -> return when {
+                r.errcode == -1 -> SyncResult.NetworkError
+                isRateLimited(r.errcode) -> SyncResult.RateLimited
+                else -> SyncResult.Failure(r.message)
+            }
             is GatewayResult.UpgradeRequired -> return SyncResult.UpgradeRequired(r.message)
         }
 
@@ -115,10 +126,13 @@ class SyncManager @Inject constructor(
         }
         bookDao.upsertAll(upserts)
 
-        // 3. 下架标记（保留历史与手动定价）
+        // 3. 下架标记（保留历史与手动定价；单事务避免逐本写触发数据库通知风暴）
         val shelfIds = shelf.books.map { it.bookId }.toSet()
-        existing.values.filter { it.bookId !in shelfIds }.forEach {
-            bookDao.markRemoved(it.bookId, now)
+        val removedIds = existing.values.filter { it.bookId !in shelfIds }.map { it.bookId }
+        if (removedIds.isNotEmpty()) {
+            db.withTransaction {
+                removedIds.forEach { bookDao.markRemoved(it, now) }
+            }
         }
 
         // 3.5 自愈：历史版本曾把 0 元误标为官方价（自导入/网文等无价书），重置为未定价
@@ -128,11 +142,13 @@ class SyncManager @Inject constructor(
         // 所有书都参与：33 开头的导入书在 notebooks 里同样有正版匹配价（实测 centPrice 2000-7799）
         var pricedCount = 0
         when (val r = client.notebooks(key)) {
-            is GatewayResult.Ok -> r.data.forEach { p ->
-                if (!p.hasPrice || p.priceFen <= 0) return@forEach
-                bookDao.updatePrice(p.bookId, p.priceFen, PriceSource.WEREAD, now)
-                cachePrice(p.bookId, p.priceFen, now)
-                pricedCount++
+            is GatewayResult.Ok -> db.withTransaction {
+                r.data.forEach { p ->
+                    if (!p.hasPrice || p.priceFen <= 0) return@forEach
+                    bookDao.updatePrice(p.bookId, p.priceFen, PriceSource.WEREAD, now)
+                    cachePrice(p.bookId, p.priceFen, now)
+                    pricedCount++
+                }
             }
             is GatewayResult.Err -> { /* 定价失败不阻塞同步 */ }
             is GatewayResult.UpgradeRequired -> return SyncResult.UpgradeRequired(r.message)
@@ -145,6 +161,7 @@ class SyncManager @Inject constructor(
             val unpriced = bookDao.getUnpriced().take(MAX_PRICE_FETCH)
             val unpricedIds = unpriced.map { it.bookId }.toSet()
             var batchHandled = false
+            val pendingPrices = mutableListOf<Pair<String, Long>>()
 
             // 通道 A：网页版书架同步（可能一次携带全量价格）
             try {
@@ -158,9 +175,7 @@ class SyncManager @Inject constructor(
                             val id = b.str("bookId")
                             if (id.isBlank() || id !in unpricedIds) return@forEach
                             val fen = (b["centPrice"] as? JsonPrimitive)?.longOrNull ?: return@forEach
-                            bookDao.updatePrice(id, fen, PriceSource.WEREAD, now)
-                            cachePrice(id, fen, now)
-                            pricedCount++
+                            pendingPrices += id to fen
                             found++
                         }
                     }
@@ -177,18 +192,28 @@ class SyncManager @Inject constructor(
                 for ((idx, b) in unpriced.withIndex()) {
                     tracker.update(15 + (idx + 1) * 35 / unpriced.size, "获取书籍价格 ${idx + 1}/${unpriced.size}")
                     if (idx > 0) delay(PRICE_FETCH_THROTTLE_MS)
+                    // 每批之间额外休息，降低连续请求触发风控的概率
+                    if (idx > 0 && idx % PRICE_BATCH_SIZE == 0) delay(PRICE_BATCH_PAUSE_MS)
                     val fen = fetchPriceFenViaPrivate(b.bookId, cookie)
                     if (fen == null) {
                         failed++
                         continue
                     }
-                    bookDao.updatePrice(b.bookId, fen, PriceSource.WEREAD, now)
-                    cachePrice(b.bookId, fen, now)
-                    pricedCount++
+                    pendingPrices += b.bookId to fen
                 }
-                if (failed > 0 && pricedCount == 0) {
+                if (failed > 0 && pendingPrices.isEmpty()) {
                     priceWarning = "仍有 ${failed} 本未能获取官方价格，可手动补录"
                 }
+            }
+            // 批量落库（单事务，避免逐本写触发数据库通知风暴）
+            if (pendingPrices.isNotEmpty()) {
+                db.withTransaction {
+                    pendingPrices.forEach { (id, fen) ->
+                        bookDao.updatePrice(id, fen, PriceSource.WEREAD, now)
+                        cachePrice(id, fen, now)
+                    }
+                }
+                pricedCount += pendingPrices.size
             }
             refreshNickname(cookie)
         }
@@ -201,43 +226,101 @@ class SyncManager @Inject constructor(
             !(local.progressFetchedAt > 0 && local.progressFetchedAt >= sb.readUpdateTime)
         }
         tracker.update(50, "获取阅读进度 0/${needList.size}")
-        for ((idx, sb) in needList.withIndex()) {
-            val local = booksAfter[sb.bookId] ?: continue
 
-            val p = when (val r = client.getProgress(key, sb.bookId)) {
-                is GatewayResult.Ok -> r.data
-                is GatewayResult.Err -> continue // 单本失败跳过
-                is GatewayResult.UpgradeRequired -> return SyncResult.UpgradeRequired(r.message)
+        // 批量落库缓冲：逐本写会触发数据库通知风暴（万本量级时 UI 卡死），
+        // 每 PROGRESS_BATCH_SIZE 本在一个事务中写入一次
+        val progressBatch = mutableListOf<Pair<BookEntity, ProgressDto>>()
+        suspend fun flushProgressBatch() {
+            if (progressBatch.isEmpty()) return
+            db.withTransaction {
+                progressBatch.forEach { (local, p) ->
+                    // 已读完（finishTime>0 或书架 finishReading 标记）：
+                    // 远端进度 ≥99 或 =0（部分读完书微信读书不返回进度数据）都按 100% 计，
+                    // 修复"已读完显示 99%/0%"；进度明显回落（如重读）按实际进度计
+                    val finishedNow = p.finished || local.finished
+                    val remoteEff = when {
+                        finishedNow && p.progressRatio >= 0.99 -> 1.0
+                        finishedNow && p.progressRatio <= 0.0 -> 1.0
+                        else -> p.progressRatio
+                    }
+                    // 手动调节过的进度与远端取较长者：手动进度不会被同步覆盖回退；
+                    // 读完（remoteEff=1.0）时 max 天然回到 100%
+                    val eff = maxOf(local.progress, remoteEff)
+                    // 远端进度覆盖了手动进度时清除「手动」标记
+                    if (remoteEff > local.progress) bookDao.clearProgressManual(local.bookId)
+                    bookDao.updateProgress(
+                        bookId = local.bookId,
+                        progress = eff,
+                        finished = finishedNow,
+                        totalReadSeconds = maxOf(local.totalReadSeconds, p.recordReadingTime),
+                        lastReadAt = maxOf(local.lastReadAt, p.updateTime),
+                        ts = now,
+                        fetchedAt = now
+                    )
+                    readHistoryDao.upsertAll(
+                        listOf(ReadHistoryEntity(bookId = local.bookId, date = today.toString(), progress = eff))
+                    )
+                }
             }
-            tracker.update(50 + (idx + 1) * 40 / needList.size, "获取阅读进度 ${idx + 1}/${needList.size}")
-
-            bookDao.updateProgress(
-                bookId = sb.bookId,
-                progress = p.progressRatio,
-                finished = p.finished || sb.finishReading || local.finished,
-                totalReadSeconds = maxOf(local.totalReadSeconds, p.recordReadingTime),
-                lastReadAt = maxOf(local.lastReadAt, p.updateTime),
-                ts = now,
-                fetchedAt = now
-            )
-            readHistoryDao.upsertAll(
-                listOf(ReadHistoryEntity(bookId = sb.bookId, date = today.toString(), progress = p.progressRatio))
-            )
+            progressBatch.clear()
         }
+
+        var rateLimitedStreak = 0
+        var done = 0
+        try {
+            for (sb in needList) {
+                val local = booksAfter[sb.bookId] ?: continue
+                val fetch = fetchProgressResilient(key, sb.bookId)
+                val p = fetch.progress
+                if (p == null) {
+                    if (fetch.rateLimited) {
+                        rateLimitedStreak++
+                        if (rateLimitedStreak >= RATE_LIMIT_STREAK_BREAK) {
+                            // 风控持续触发：中断本阶段，剩余进度下次同步补
+                            tracker.update(89, "接口持续限流，剩余进度下次同步补充")
+                            break
+                        }
+                    }
+                    continue
+                }
+                rateLimitedStreak = 0
+                done++
+                // 书架标记已读完的书同样按读完处理（本地 finished 标记在批量落库时合并）
+                val localForBatch = if (sb.finishReading && !local.finished) local.copy(finished = true) else local
+                progressBatch += localForBatch to p
+                if (progressBatch.size >= PROGRESS_BATCH_SIZE) {
+                    flushProgressBatch()
+                    delay(PROGRESS_BATCH_PAUSE_MS) // 分批休息，避免连续请求触发风控
+                }
+                // 进度条每 5 本更新一次：万本量级时避免墨水屏频繁重绘
+                if (done % 5 == 0 || done == needList.size) {
+                    tracker.update(50 + done * 40 / needList.size, "获取阅读进度 $done/${needList.size}")
+                }
+            }
+        } catch (e: UpgradeException) {
+            flushProgressBatch() // 已获取的进度仍落库
+            return SyncResult.UpgradeRequired(e.message ?: "微信读书 Skill 版本已升级")
+        }
+        flushProgressBatch()
 
         // 6. readdata 回溯（提供按日权重；顺带收集时长榜书单）
         val longestBooks = backfillReadSeconds(key, today)
         tracker.update(91, "阅读统计获取完成")
 
         // 6.5 补捞读完移出书架的书（readLongest 与书架状态无关）
-        fetchLongestBooks(key, cookie, longestBooks, now)
+        try {
+            fetchLongestBooks(key, cookie, longestBooks, now)
+        } catch (e: UpgradeException) {
+            return SyncResult.UpgradeRequired(e.message ?: "微信读书 Skill 版本已升级")
+        }
         tracker.update(92, "已移出书架书籍获取完成")
 
         // 7. 本地重建每日价值（含逐书明细；幂等，定价变化与历史数据都能正确反映）
         rebuildDailyValues(today)
         tracker.update(97, "计算回本价值完成")
 
-        val booksFinal = bookDao.getShelfBooksOnce()
+        // 同步统计口径排除隐藏书（隐藏书数据仍同步保持新鲜，但不计入价值统计）
+        val booksFinal = bookDao.getShelfBooksOnce().filter { !it.hidden }
         val totalValueFen = booksFinal.sumOf { (it.progress * it.priceFen).toLong() }
         // 0 元的书（无论来源）归入"获取价格失败"
         val pricedCountFinal = booksFinal.count { it.priceSource != PriceSource.NONE && it.priceFen > 0 }
@@ -250,6 +333,255 @@ class SyncManager @Inject constructor(
             totalValueFen = totalValueFen,
             priceWarning = priceWarning
         )
+    }
+
+    /** 书架同步：限流(403/429)时退避重试，风控常在上一轮大量请求后发生 */
+    private suspend fun shelfSyncWithRetry(key: String): GatewayResult<ShelfSyncDto> {
+        var attempt = 0
+        while (true) {
+            when (val r = client.shelfSync(key)) {
+                is GatewayResult.Err -> {
+                    if (isRateLimited(r.errcode) && attempt < SHELF_RETRY_MAX) {
+                        attempt++
+                        tracker.updateLabel("接口限流，稍候重试 $attempt/$SHELF_RETRY_MAX")
+                        delay(RATE_LIMIT_BACKOFF_MS * attempt)
+                        continue
+                    }
+                    return r
+                }
+                else -> return r
+            }
+        }
+    }
+
+    /**
+     * 拉取单本进度（限流友好）：403/429 退避等待后重试一次；
+     * 仍失败返回 null（该本跳过不阻塞整体）；Skill 升级提示向上抛出。
+     * [rateLimited] 标记失败原因是否为限流（普通网络失败不计入限流中断计数）。
+     */
+    private suspend fun fetchProgressResilient(key: String, bookId: String): ProgressFetch {
+        val first = client.getProgress(key, bookId)
+        if (first is GatewayResult.UpgradeRequired) throw UpgradeException(first.message)
+        if (first !is GatewayResult.Err || !isRateLimited(first.errcode)) {
+            return ProgressFetch((first as? GatewayResult.Ok)?.data, rateLimited = false)
+        }
+        tracker.updateLabel("接口限流，暂停 ${RATE_LIMIT_BACKOFF_MS / 1000} 秒后继续")
+        delay(RATE_LIMIT_BACKOFF_MS)
+        return when (val retry = client.getProgress(key, bookId)) {
+            is GatewayResult.Ok -> ProgressFetch(retry.data, rateLimited = false)
+            is GatewayResult.UpgradeRequired -> throw UpgradeException(retry.message)
+            else -> ProgressFetch(null, rateLimited = true)
+        }
+    }
+
+    /** 单本进度拉取结果（null = 失败跳过；rateLimited 区分限流与普通失败） */
+    private class ProgressFetch(val progress: ProgressDto?, val rateLimited: Boolean)
+
+    private fun isRateLimited(code: Int): Boolean = code == 403 || code == 429
+
+    /** 进度拉取途中收到 Skill 版本升级提示（必须中止同步并提示用户） */
+    private class UpgradeException(message: String?) : Exception(message)
+
+    /**
+     * 单书重新同步微信读书阅读进度：**纯查询**（编辑弹窗点「保存」时才落库），
+     * 读完判定与全量同步一致（finishTime>0 且远端进度 ≥99 或 =0 按 100%）。
+     */
+    suspend fun resyncBookProgress(bookId: String, key: String): ResyncProgressResult {
+        val r = client.getProgress(key, bookId)
+        if (r !is GatewayResult.Ok) {
+            return when (r) {
+                is GatewayResult.Err -> ResyncProgressResult.Failed(
+                    if (r.errcode == -1) "无网络连接，请检查网络后重试"
+                    else "获取进度失败：${r.message}"
+                )
+                is GatewayResult.UpgradeRequired -> ResyncProgressResult.Failed(r.message)
+                is GatewayResult.Ok -> error("unreachable")
+            }
+        }
+        val p = r.data
+        // 已读完：远端进度 ≥99 或 =0（部分读完书不返回进度数据）都按 100% 计
+        val eff = when {
+            p.finished && p.progressRatio >= 0.99 -> 1.0
+            p.finished && p.progressRatio <= 0.0 -> 1.0
+            else -> p.progressRatio
+        }
+        return ResyncProgressResult.Success((eff * 100).toInt(), p.finished)
+    }
+
+    /**
+     * 保存单书同步获取的阅读进度（编辑弹窗点「保存」时调用）：
+     * 以微信读书进度写入、清除「手动」标记并记录当天进度快照。
+     */
+    suspend fun applyRestoredProgress(bookId: String, progressPct: Int) {
+        val now = System.currentTimeMillis()
+        val progress = progressPct.coerceIn(0, 100) / 100.0
+        bookDao.updateBookProgress(bookId, progress, progressPct >= 100, now)
+        bookDao.clearProgressManual(bookId)
+        readHistoryDao.upsertAll(
+            listOf(ReadHistoryEntity(bookId = bookId, date = LocalDate.now().toString(), progress = progress))
+        )
+    }
+
+    /**
+     * 批量恢复微信读书阅读进度：逐本以远端为准写库（读完规则与全量同步一致），
+     * 覆盖后清除「手动」标记；限流退避与批量落库同全量同步；结果供 UI 反馈。
+     */
+    suspend fun resyncBooksProgress(
+        bookIds: List<String>,
+        key: String,
+        onProgress: (done: Int, total: Int) -> Unit = { _, _ -> }
+    ): BatchProgressResult {
+        val now = System.currentTimeMillis()
+        val today = LocalDate.now()
+        val titlesById = bookDao.getTitlesByIds(bookIds)
+        val failedBooks = mutableListOf<Pair<String, String>>()
+        var ok = 0
+        var notice: String? = null
+        val total = bookIds.size
+        val pending = mutableListOf<Pair<BookEntity, ProgressDto>>()
+
+        suspend fun flush() {
+            if (pending.isEmpty()) return
+            db.withTransaction {
+                pending.forEach { (local, p) ->
+                    // 已读完：远端进度 ≥99 或 =0 都按 100% 计
+                    val eff = when {
+                        p.finished && p.progressRatio >= 0.99 -> 1.0
+                        p.finished && p.progressRatio <= 0.0 -> 1.0
+                        else -> p.progressRatio
+                    }
+                    bookDao.updateProgress(
+                        bookId = local.bookId,
+                        progress = eff,
+                        finished = p.finished,
+                        totalReadSeconds = maxOf(local.totalReadSeconds, p.recordReadingTime),
+                        lastReadAt = maxOf(local.lastReadAt, p.updateTime),
+                        ts = now,
+                        fetchedAt = now
+                    )
+                    bookDao.clearProgressManual(local.bookId)
+                    readHistoryDao.upsertAll(
+                        listOf(ReadHistoryEntity(bookId = local.bookId, date = today.toString(), progress = eff))
+                    )
+                }
+            }
+            pending.clear()
+        }
+
+        try {
+            for (bookId in bookIds) {
+                val local = bookDao.getById(bookId)
+                if (local == null) {
+                    failedBooks += bookId to (titlesById[bookId] ?: "未知书名")
+                    onProgress(ok + failedBooks.size, total)
+                    continue
+                }
+                val p = fetchProgressResilient(key, bookId).progress
+                if (p == null) {
+                    failedBooks += bookId to (titlesById[bookId] ?: "未知书名")
+                    onProgress(ok + failedBooks.size, total)
+                    continue
+                }
+                ok++
+                pending += local to p
+                onProgress(ok + failedBooks.size, total)
+                if (pending.size >= PROGRESS_BATCH_SIZE) {
+                    flush()
+                    delay(PROGRESS_BATCH_PAUSE_MS)
+                }
+            }
+        } catch (e: UpgradeException) {
+            // Skill 版本升级：剩余书全部计失败，提示用户更新
+            notice = e.message ?: "微信读书 Skill 版本已升级"
+            bookIds.drop(ok + failedBooks.size).forEach { id ->
+                failedBooks += id to (titlesById[id] ?: "未知书名")
+            }
+        }
+        flush()
+        return BatchProgressResult(ok, failedBooks.size, failedBooks, notice)
+    }
+
+    /**
+     * 批量获取选中书籍的微信读书官方定价（直接写库，强制覆盖手动价、来源恢复微信读书）。
+     * 通道：官方 notebooks 一次批量 → 私有单书接口逐本兜底（400ms 节流）；
+     * 无 Cookie 时私有通道跳过（对应书计失败）。返回成功/失败数量供 UI 反馈；
+     * [onProgress] 每处理一本回调（已处理数, 总数），供 UI 显示 1/N 进度。
+     */
+    suspend fun resyncBooksPrice(
+        bookIds: List<String>,
+        key: String,
+        cookie: String?,
+        onProgress: (done: Int, total: Int) -> Unit = { _, _ -> }
+    ): BatchPriceResult {
+        val now = System.currentTimeMillis()
+        val total = bookIds.size
+        var ok = 0
+        var failed = 0
+        var done = 0
+        val titlesById = bookDao.getTitlesByIds(bookIds)
+        val failedBooks = mutableListOf<Pair<String, String>>()
+        fun recordFailed(id: String) {
+            failed++
+            done++
+            failedBooks += id to (titlesById[id] ?: "未知书名")
+            onProgress(done, total)
+        }
+
+        // 通道 1：官方 notebooks 一次请求批量命中（与全量同步定价同源）
+        val notebookPrices = mutableMapOf<String, Long>()
+        when (val r = client.notebooks(key)) {
+            is GatewayResult.Ok -> r.data.forEach { p ->
+                if (p.hasPrice && p.priceFen > 0) notebookPrices[p.bookId] = p.priceFen
+            }
+            else -> { /* notebooks 失败不阻塞，转私有通道 */ }
+        }
+        val notebookHits = mutableListOf<Pair<String, Long>>()
+        val pending = mutableListOf<String>()
+        for (id in bookIds) {
+            val fen = notebookPrices[id]
+            if (fen != null) notebookHits += id to fen else pending += id
+        }
+        if (notebookHits.isNotEmpty()) {
+            db.withTransaction {
+                notebookHits.forEach { (id, fen) ->
+                    // 恢复定价：强制覆盖手动价，来源恢复为微信读书
+                    bookDao.updatePriceForce(id, fen, PriceSource.WEREAD, now)
+                    cachePrice(id, fen, now)
+                }
+            }
+            ok += notebookHits.size
+            done += notebookHits.size
+            onProgress(done, total)
+        }
+
+        // 通道 2：私有单书接口逐本兜底（400ms 节流防限流）
+        if (!cookie.isNullOrBlank() && pending.isNotEmpty()) {
+            val privateHits = mutableListOf<Pair<String, Long>>()
+            for ((idx, id) in pending.withIndex()) {
+                if (idx > 0) delay(PRICE_FETCH_THROTTLE_MS)
+                val fen = fetchPriceFenViaPrivate(id, cookie)
+                if (fen == null) {
+                    recordFailed(id)
+                    continue
+                }
+                done++
+                onProgress(done, total)
+                privateHits += id to fen
+            }
+            if (privateHits.isNotEmpty()) {
+                db.withTransaction {
+                    privateHits.forEach { (id, fen) ->
+                        // 恢复定价：强制覆盖手动价，来源恢复为微信读书
+                        bookDao.updatePriceForce(id, fen, PriceSource.WEREAD, now)
+                        cachePrice(id, fen, now)
+                    }
+                }
+                ok += privateHits.size
+            }
+        } else {
+            pending.forEach { recordFailed(it) }
+        }
+        return BatchPriceResult(ok, failed, failedBooks)
     }
 
     /**
@@ -276,8 +608,17 @@ class SyncManager @Inject constructor(
                 return ResyncPriceResult.Success(fen)
             }
         }
-        return ResyncPriceResult.NotFound
+        // 自导入书（33/CB_ 开头）系统内无定价数据，给出明确提示而非笼统的"未找到"
+        return if (isImportedBookId(bookId)) {
+            ResyncPriceResult.NotFound("自导入书籍无官方价格，可手动录入价格")
+        } else {
+            ResyncPriceResult.NotFound()
+        }
     }
+
+    /** 是否自导入书：上传文件 bookId 以 33 开头，导入匹配内容库以 CB_ 开头（与 Book.isImported 同口径） */
+    private fun isImportedBookId(bookId: String): Boolean =
+        bookId.startsWith("33") || bookId.startsWith("CB_")
 
     /**
      * 私有通道单本取价（分）：网页版优先、子域兜底。
@@ -392,6 +733,7 @@ class SyncManager @Inject constructor(
      * 补捞时长榜书单：不在本地 books 表的书（读完即移出书架、从未在书架同步过）
      * 补建记录 + 补进度（官方 getprogress 按 bookId 查询，不限书架）+ 补价。
      * 补建后 removed=1 且 progress>0，进入价值统计口径（observeReadBooks）。
+     * 网络逐本获取，落库批量执行（万本量级时逐本写会阻塞 UI）。
      */
     private suspend fun fetchLongestBooks(
         key: String,
@@ -399,64 +741,104 @@ class SyncManager @Inject constructor(
         longest: List<LongestBookDto>,
         now: Long
     ) {
+        val pending = mutableListOf<PendingLongestBook>()
+        suspend fun flushPending() {
+            if (pending.isEmpty()) return
+            db.withTransaction {
+                pending.forEach { pl ->
+                    bookDao.upsertAll(listOf(pl.entity))
+                    pl.progress?.let { p ->
+                        bookDao.updateProgress(
+                            bookId = pl.entity.bookId,
+                            progress = p.effectiveRatio,
+                            finished = p.finished,
+                            totalReadSeconds = p.recordReadingTime,
+                            lastReadAt = p.updateTime,
+                            ts = now,
+                            fetchedAt = now
+                        )
+                    }
+                    if (pl.author.isNotBlank()) {
+                        bookDao.updateAuthorIfBlank(pl.entity.bookId, pl.author, now)
+                    }
+                    pl.priceFen?.let { fen ->
+                        bookDao.updatePrice(pl.entity.bookId, fen, PriceSource.WEREAD, now)
+                        cachePrice(pl.entity.bookId, fen, now)
+                    }
+                }
+            }
+            pending.clear()
+        }
+
         for ((idx, lb) in longest.withIndex()) {
             if (idx > 0) delay(PRICE_FETCH_THROTTLE_MS) // 补捞书多时节流防限流
-            // 补捞逐本进度（含补进度与补价，避免进度条冻结在"统计回溯完成"）
-            tracker.update(91 + (idx + 1) / longest.size, "获取已移出书架书籍信息 ${idx + 1}/${longest.size}")
-            if (bookDao.getById(lb.bookId) != null) continue
-            bookDao.upsertAll(
-                listOf(
-                    BookEntity(
-                        bookId = lb.bookId,
-                        title = lb.title.ifBlank { "未知书名" },
-                        onShelf = false,
-                        removed = true,
-                        createdAt = now,
-                        updatedAt = now
-                    )
-                )
-            )
-            when (val p = client.getProgress(key, lb.bookId)) {
-                is GatewayResult.Ok -> {
-                    bookDao.updateProgress(
-                        bookId = lb.bookId,
-                        progress = p.data.progressRatio,
-                        finished = p.data.finished,
-                        totalReadSeconds = p.data.recordReadingTime,
-                        lastReadAt = p.data.updateTime,
-                        ts = now,
-                        fetchedAt = now
-                    )
-                }
-                is GatewayResult.Err -> { /* 单本失败不影响其他 */ }
-                is GatewayResult.UpgradeRequired -> return
+            // 补捞逐本进度（含补进度与补价，避免进度条冻结在"统计回溯完成"；每 5 本更新防重绘）
+            if (idx % 5 == 0 || idx == longest.size - 1) {
+                tracker.update(91 + (idx + 1) / longest.size, "获取已移出书架书籍信息 ${idx + 1}/${longest.size}")
             }
+            if (bookDao.getById(lb.bookId) != null) continue
+            val entity = BookEntity(
+                bookId = lb.bookId,
+                title = lb.title.ifBlank { "未知书名" },
+                onShelf = false,
+                removed = true,
+                createdAt = now,
+                updatedAt = now
+            )
+            // 限流时退避重试一次；单本失败不影响其他；UpgradeRequired 向上抛出
+            val progress = fetchProgressResilient(key, lb.bookId).progress
+            var author = ""
+            var priceFen: Long? = null
             if (!cookie.isNullOrBlank()) {
                 val meta = fetchPrivateMeta(lb.bookId, cookie)
                 // 补捞书补作者（书值页正常显示作者，替代「已移出书架」标注）
-                if (meta.author.isNotBlank()) {
-                    bookDao.updateAuthorIfBlank(lb.bookId, meta.author, now)
-                }
-                if (meta.priceFen != null) {
-                    bookDao.updatePrice(lb.bookId, meta.priceFen, PriceSource.WEREAD, now)
-                    cachePrice(lb.bookId, meta.priceFen, now)
-                }
+                author = meta.author
+                priceFen = meta.priceFen
+            }
+            pending += PendingLongestBook(entity, progress, author, priceFen)
+            if (pending.size >= PROGRESS_BATCH_SIZE) {
+                flushPending()
+                delay(PROGRESS_BATCH_PAUSE_MS)
             }
         }
+        flushPending()
     }
+
+    /** 补捞书待落库数据（网络逐本获取，落库批量执行） */
+    private class PendingLongestBook(
+        val entity: BookEntity,
+        val progress: ProgressDto?,
+        val author: String,
+        val priceFen: Long?
+    )
 
     /**
      * 本地重建每日价值（幂等）：清空后按 read_history 进度快照逐段重放，
      * 每段 Δ价值按每日阅读秒数加权分布到各天，同时重建逐书明细。
      * 纯本地计算，无需网络。
+     * 实现：全量数据一次性载入内存聚合，最后单事务落库——
+     * 万本量级时避免逐本查询/逐条写造成的分钟级卡顿。
      */
     private suspend fun rebuildDailyValues(today: LocalDate) {
-        dailyBookStatDao.deleteAll()
-        dailyStatDao.resetValues()
+        val dailySecMap = dailyStatDao.getAllOnce().associate { it.date to it.readSeconds }
+        val rowsByBook = readHistoryDao.getAllValuedBooks().groupBy { it.bookId }
         val window = windowStart(today)
-        for (b in bookDao.getShelfBooksOnce()) {
+
+        // 内存聚合（valueFen/bookCount 从零开始累加，等价于先 resetValues 再逐条累加）
+        val dayValue = mutableMapOf<String, Long>()
+        val dayCount = mutableMapOf<String, Int>()
+        val dayBookValue = mutableMapOf<Pair<String, String>, Long>()
+        fun add(date: LocalDate, valueFen: Long, bookId: String) {
+            val key = date.toString()
+            dayValue[key] = (dayValue[key] ?: 0L) + valueFen
+            dayCount[key] = (dayCount[key] ?: 0) + 1
+            val bookKey = key to bookId
+            dayBookValue[bookKey] = (dayBookValue[bookKey] ?: 0L) + valueFen
+        }
+
+        for (b in bookDao.getReadBooksOnce()) {
             if (b.priceFen <= 0) continue
-            val rows = readHistoryDao.getAllForBook(b.bookId)
+            val rows = rowsByBook[b.bookId].orEmpty()
             var prevProgress = 0.0
             var prevDate = window
             for (row in rows) {
@@ -464,7 +846,7 @@ class SyncManager @Inject constructor(
                 if (delta > 0) {
                     distribute(
                         ValueDelta(b.bookId, (delta * b.priceFen).toLong(), maxOf(prevDate.plusDays(1), window)),
-                        today
+                        today, dailySecMap, ::add
                     )
                 }
                 prevProgress = row.progress
@@ -475,9 +857,30 @@ class SyncManager @Inject constructor(
             if (tail > 0) {
                 distribute(
                     ValueDelta(b.bookId, (tail * b.priceFen).toLong(), maxOf(prevDate.plusDays(1), window)),
-                    today
+                    today, dailySecMap, ::add
                 )
             }
+        }
+
+        // 单事务落库：清空明细 + 重置价值 + 批量写入聚合结果
+        db.withTransaction {
+            dailyBookStatDao.deleteAll()
+            dailyStatDao.resetValues()
+            dailyStatDao.upsertAll(
+                dayValue.map { (date, v) ->
+                    DailyStatEntity(
+                        date = date,
+                        valueFen = v,
+                        readSeconds = dailySecMap[date] ?: 0L,
+                        bookCount = dayCount[date] ?: 0
+                    )
+                }
+            )
+            dailyBookStatDao.upsertAll(
+                dayBookValue.map { (key, v) ->
+                    DailyBookStatEntity(date = key.first, bookId = key.second, valueFen = v)
+                }
+            )
         }
     }
 
@@ -485,8 +888,14 @@ class SyncManager @Inject constructor(
      * 把一本书的 Δ价值分布到 (fromDate, today]：
      * - 区间 ≤ 7 天：按每日阅读秒数加权分摊（频繁同步时平滑）
      * - 区间 > 7 天：整段归到区间最后一天（快照日），避免价值摊到没读该书的日期
+     * 纯函数：读秒数查内存映射，结果经 [add] 回调聚合（不再逐条访问数据库）。
      */
-    private suspend fun distribute(v: ValueDelta, today: LocalDate) {
+    private fun distribute(
+        v: ValueDelta,
+        today: LocalDate,
+        dailySecMap: Map<String, Long>,
+        add: (LocalDate, Long, String) -> Unit
+    ) {
         val days = mutableListOf<LocalDate>()
         var d = v.fromDate
         while (!d.isAfter(today)) {
@@ -494,45 +903,26 @@ class SyncManager @Inject constructor(
             d = d.plusDays(1)
         }
         if (days.size > 7) {
-            addDailyValue(days.last(), v.valueFen, 1, v.bookId)
+            add(days.last(), v.valueFen, v.bookId)
             return
         }
-        val weights = days.associateWith { dailyStatDao.get(it.toString())?.readSeconds ?: 0L }
-        val totalSec = weights.values.sum()
+        val totalSec = days.sumOf { dailySecMap[it.toString()] ?: 0L }
         if (totalSec <= 0) {
-            addDailyValue(today, v.valueFen, 1, v.bookId)
+            add(today, v.valueFen, v.bookId)
             return
         }
         var allocated = 0L
         for (day in days) {
-            val sec = weights[day] ?: 0L
+            val sec = dailySecMap[day.toString()] ?: 0L
             if (sec <= 0) continue
             val part = v.valueFen * sec / totalSec
             if (part > 0) {
-                addDailyValue(day, part, 1, v.bookId)
+                add(day, part, v.bookId)
                 allocated += part
             }
         }
         val remainder = v.valueFen - allocated
-        if (remainder > 0) addDailyValue(today, remainder, 1, v.bookId)
-    }
-
-    private suspend fun addDailyValue(date: LocalDate, valueFen: Long, bookCount: Int, bookId: String) {
-        val key = date.toString()
-        val cur = dailyStatDao.get(key)
-        dailyStatDao.upsert(
-            DailyStatEntity(
-                date = key,
-                valueFen = (cur?.valueFen ?: 0L) + valueFen,
-                readSeconds = cur?.readSeconds ?: 0L,
-                bookCount = (cur?.bookCount ?: 0) + bookCount
-            )
-        )
-        // 每日每书价值明细（柱状图点选展示）
-        val bookCur = dailyBookStatDao.getValue(key, bookId) ?: 0L
-        dailyBookStatDao.upsertAll(
-            listOf(DailyBookStatEntity(date = key, bookId = bookId, valueFen = bookCur + valueFen))
-        )
+        if (remainder > 0) add(today, remainder, v.bookId)
     }
 
     private data class ValueDelta(val bookId: String, val valueFen: Long, val fromDate: LocalDate)
@@ -548,6 +938,20 @@ class SyncManager @Inject constructor(
         private const val MAX_PRICE_FETCH = 200
         /** 逐本补价节流（防微信读书接口限流） */
         private const val PRICE_FETCH_THROTTLE_MS = 400L
+        /** 私有通道补价分批大小：每批之间额外休息，降低连续请求触发风控概率 */
+        private const val PRICE_BATCH_SIZE = 50
+        /** 私有通道补价分批休息间隔 */
+        private const val PRICE_BATCH_PAUSE_MS = 5_000L
+        /** 进度逐本拉取分批大小：每批落库一次并额外休息（防限流 + 防数据库通知风暴） */
+        private const val PROGRESS_BATCH_SIZE = 50
+        /** 进度分批休息间隔 */
+        private const val PROGRESS_BATCH_PAUSE_MS = 10_000L
+        /** 限流(403/429)退避等待 */
+        private const val RATE_LIMIT_BACKOFF_MS = 30_000L
+        /** 连续限流本数达到该值则中断进度拉取，剩余下次同步补 */
+        private const val RATE_LIMIT_STREAK_BREAK = 5
+        /** 书架同步限流重试次数 */
+        private const val SHELF_RETRY_MAX = 2
         /** 历史回溯月数（12 年：覆盖微信读书 2015 年上线至今的全部历史；
          * 注册时间与连续 6 个空月会提前终止，近期用户不会跑满） */
         private const val BACKFILL_MONTHS = 144

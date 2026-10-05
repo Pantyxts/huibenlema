@@ -5,6 +5,7 @@ import java.time.Instant
 import java.time.ZoneId
 import javax.inject.Inject
 import javax.inject.Singleton
+import retrofit2.HttpException
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
@@ -68,26 +69,49 @@ class OfficialGatewayClient @Inject constructor(
         }
     }
 
-    /** 官方批量定价：/user/notebooks（只覆盖有笔记的书，其余由私有 API/ISBN/手动补全） */
+    /**
+     * 官方批量定价：/user/notebooks（只覆盖有笔记的书，其余由私有 API/ISBN/手动补全）。
+     * 分页拉全：响应 hasMore=1 时用 synckey 作 lastSort 翻页，
+     * 重复页（游标语义不符导致返回相同书）自动终止，另设页数上限双保险。
+     */
     suspend fun notebooks(key: String): GatewayResult<List<BookPriceDto>> {
-        return when (val r = call(key, "/user/notebooks", mapOf("count" to JsonPrimitive(100)))) {
-            is GatewayResult.Ok -> {
-                val books = (r.data["books"] as? JsonArray)?.mapNotNull { it as? JsonObject } ?: emptyList()
-                GatewayResult.Ok(books.mapNotNull { nb ->
-                    val b = nb["book"] as? JsonObject ?: return@mapNotNull null
-                    val id = b.str("bookId").takeIf { it.isNotBlank() } ?: return@mapNotNull null
-                    BookPriceDto(
-                        bookId = id,
-                        priceFen = parsePriceFen(b),
-                        // 任一价格字段存在且 >0 才算"有价"；全 0/缺失 = 系统内无定价数据
-                        hasPrice = b.lng("centPrice") > 0L || b.lng("originalPrice") > 0L || b.dbl("price") > 0.0,
-                        isFree = b.lng("centPrice") == 0L && b.lng("bookStatus") == 1L
-                    )
-                })
+        val all = mutableListOf<BookPriceDto>()
+        val seenIds = mutableSetOf<String>()
+        var lastSort: Long? = null
+        var pages = 0
+        while (pages < MAX_NOTEBOOK_PAGES) {
+            val params = mutableMapOf("count" to JsonPrimitive(100))
+            lastSort?.let { params["lastSort"] = JsonPrimitive(it) }
+            when (val r = call(key, "/user/notebooks", params)) {
+                is GatewayResult.Ok -> {
+                    val books = (r.data["books"] as? JsonArray)?.mapNotNull { it as? JsonObject } ?: emptyList()
+                    var newCount = 0
+                    books.forEach { nb ->
+                        val b = nb["book"] as? JsonObject ?: return@forEach
+                        val id = b.str("bookId").takeIf { it.isNotBlank() } ?: return@forEach
+                        if (id in seenIds) return@forEach // 重复页保护
+                        seenIds += id
+                        newCount++
+                        all += BookPriceDto(
+                            bookId = id,
+                            priceFen = parsePriceFen(b),
+                            // 任一价格字段存在且 >0 才算"有价"；全 0/缺失 = 系统内无定价数据
+                            hasPrice = b.lng("centPrice") > 0L || b.lng("originalPrice") > 0L || b.dbl("price") > 0.0,
+                            isFree = b.lng("centPrice") == 0L && b.lng("bookStatus") == 1L
+                        )
+                    }
+                    val hasMore = r.data.lng("hasMore") == 1L
+                    val nextSort = r.data.lng("synckey")
+                    // 无更多/无新增（游标语义不符返回重复页）/无有效游标 → 结束
+                    if (!hasMore || newCount == 0 || nextSort <= 0) break
+                    lastSort = nextSort
+                    pages++
+                }
+                is GatewayResult.Err -> return r
+                is GatewayResult.UpgradeRequired -> return r
             }
-            is GatewayResult.Err -> r
-            is GatewayResult.UpgradeRequired -> r
         }
+        return GatewayResult.Ok(all)
     }
 
     /** 阅读统计（monthly）：readTimes 按天分桶 → 每日阅读秒数 */
@@ -149,6 +173,9 @@ class OfficialGatewayClient @Inject constructor(
             } else {
                 GatewayResult.Ok(resp)
             }
+        } catch (e: HttpException) {
+            // HTTP 非 2xx（403 限流等）：透出状态码供同步层退避重试
+            GatewayResult.Err(e.code(), "请求被拒绝（HTTP ${e.code()}）")
         } catch (e: IOException) {
             GatewayResult.Err(-1, "网络错误：${e.message}")
         } catch (e: Exception) {
@@ -159,6 +186,9 @@ class OfficialGatewayClient @Inject constructor(
     companion object {
         /** 官方 Skill 包版本（v1.0.4）；请求必带 */
         const val SKILL_VERSION = "1.0.4"
+
+        /** notebooks 分页翻页上限（每页 100 本，防游标异常死循环） */
+        private const val MAX_NOTEBOOK_PAGES = 50
 
         /**
          * 价格解析：centPrice(分) 优先；originalPrice/price 为元（实测 originalPrice 常为 0）。

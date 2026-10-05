@@ -3,6 +3,7 @@ package com.huibenlema.app.ui.settings
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -18,6 +19,8 @@ import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardOptions
@@ -38,9 +41,12 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
 import androidx.hilt.navigation.compose.hiltViewModel
@@ -48,6 +54,7 @@ import androidx.lifecycle.compose.LifecycleResumeEffect
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.huibenlema.app.BuildConfig
 import com.huibenlema.app.data.update.UpdateManager
+import com.huibenlema.app.domain.model.Book
 import com.huibenlema.app.domain.model.CostCategory
 import com.huibenlema.app.domain.model.CostItem
 import com.huibenlema.app.domain.model.displayName
@@ -78,7 +85,9 @@ fun SettingsScreen(vm: SettingsViewModel = hiltViewModel()) {
     val accountVid by vm.accountVid.collectAsStateWithLifecycle()
     val customCategories by vm.customCategories.collectAsStateWithLifecycle()
     val updateState by vm.updateState.collectAsStateWithLifecycle()
+    val hiddenBooks by vm.hiddenBooks.collectAsStateWithLifecycle()
     var costExpanded by remember { mutableStateOf(false) }
+    var showHiddenBooks by remember { mutableStateOf(false) }
 
     // 进入设置页即清除首页"发现新版本"横幅
     LaunchedEffect(Unit) { vm.clearPendingUpdate() }
@@ -284,6 +293,9 @@ fun SettingsScreen(vm: SettingsViewModel = hiltViewModel()) {
                     importLauncher.launch(arrayOf("application/json"))
                 })
                 DataActionRow("清除数据", onClick = vm::openClearMenu)
+                DataActionRow("隐藏书籍${if (hiddenBooks.isNotEmpty()) "（${hiddenBooks.size} 本）" else ""}") {
+                    showHiddenBooks = true
+                }
             }
         }
         Spacer(Modifier.height(16.dp))
@@ -508,6 +520,17 @@ fun SettingsScreen(vm: SettingsViewModel = hiltViewModel()) {
         }
         else -> {}
     }
+    // 隐藏书籍列表：多选勾选后移出隐藏（恢复显示）
+    if (showHiddenBooks) {
+        HiddenBooksDialog(
+            books = hiddenBooks,
+            onDismiss = { showHiddenBooks = false },
+            onRestore = { ids ->
+                vm.restoreHidden(ids)
+                showHiddenBooks = false
+            }
+        )
+    }
     // 退出登录确认
     if (vm.showLogoutConfirm) {
         EinkDialog(
@@ -589,6 +612,102 @@ private fun DataActionRow(label: String, onClick: () -> Unit) {
             .padding(horizontal = 12.dp, vertical = 14.dp)
     ) {
         Text(label, style = MaterialTheme.typography.bodyMedium)
+    }
+}
+
+/** 隐藏书籍列表对话框：多选勾选后移出隐藏（恢复显示并重新参与价值计算） */
+@Composable
+private fun HiddenBooksDialog(
+    books: List<Book>,
+    onDismiss: () -> Unit,
+    onRestore: (List<String>) -> Unit
+) {
+    var selectedIds by remember { mutableStateOf(setOf<String>()) }
+
+    EinkDialog(
+        onDismissRequest = onDismiss,
+        title = "隐藏书籍",
+        confirmText = "移出隐藏",
+        onConfirm = {
+            if (selectedIds.isNotEmpty()) onRestore(selectedIds.toList())
+        },
+        dismissText = "关闭"
+    ) {
+        if (books.isEmpty()) {
+            Text("暂无隐藏书籍", style = MaterialTheme.typography.bodyMedium, color = GrayDark)
+        } else {
+            val allSelected = selectedIds.size == books.size
+            EinkChip(
+                label = if (allSelected) "取消全选" else "全选",
+                selected = true,
+                whiteSelected = true
+            ) {
+                selectedIds = if (allSelected) emptySet()
+                else books.map { it.bookId }.toSet()
+            }
+            Spacer(Modifier.height(6.dp))
+            LazyColumn(Modifier.heightIn(max = 280.dp)) {
+                items(books, key = { it.bookId }) { b ->
+                    val interactionSource = remember { MutableInteractionSource() }
+                    Row(
+                        Modifier
+                            .fillMaxWidth()
+                            .clickable(
+                                interactionSource = interactionSource,
+                                indication = null,
+                                onClick = {
+                                    selectedIds = if (b.bookId in selectedIds) selectedIds - b.bookId
+                                    else selectedIds + b.bookId
+                                }
+                            )
+                            .padding(vertical = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        // Canvas 直线勾：未选中画白色不可见，切换无闪烁
+                        Box(
+                            Modifier
+                                .size(18.dp)
+                                .border(1.dp, InkBlack),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Canvas(Modifier.size(12.dp)) {
+                                val color = if (b.bookId in selectedIds) InkBlack else Color.White
+                                val w = size.width
+                                val h = size.height
+                                val sw = w * 0.16f
+                                drawLine(
+                                    color = color,
+                                    start = Offset(w * 0.14f, h * 0.52f),
+                                    end = Offset(w * 0.42f, h * 0.80f),
+                                    strokeWidth = sw,
+                                    cap = StrokeCap.Square
+                                )
+                                drawLine(
+                                    color = color,
+                                    start = Offset(w * 0.42f, h * 0.80f),
+                                    end = Offset(w * 0.92f, h * 0.18f),
+                                    strokeWidth = sw,
+                                    cap = StrokeCap.Square
+                                )
+                            }
+                        }
+                        Spacer(Modifier.width(8.dp))
+                        Text(
+                            b.title,
+                            style = MaterialTheme.typography.bodyMedium,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                }
+            }
+            Spacer(Modifier.height(4.dp))
+            Text(
+                "已选 ${selectedIds.size} 本，移出后恢复显示并重新参与价值计算",
+                style = MaterialTheme.typography.bodySmall,
+                color = GrayDark
+            )
+        }
     }
 }
 

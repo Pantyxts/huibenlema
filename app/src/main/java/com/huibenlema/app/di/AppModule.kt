@@ -80,8 +80,8 @@ object AppModule {
     @Singleton
     fun provideDatabase(@ApplicationContext context: Context): AppDatabase =
         Room.databaseBuilder(context, AppDatabase::class.java, "huibenlema.db")
-            // v3 → v4 有正式迁移（不清数据）；未知版本兜底重建
-            .addMigrations(AppDatabase.MIGRATION_3_4)
+            // 正式迁移（不清数据）；未知版本兜底重建
+            .addMigrations(AppDatabase.MIGRATION_3_4, AppDatabase.MIGRATION_4_5, AppDatabase.MIGRATION_5_6)
             .fallbackToDestructiveMigration()
             .build()
 

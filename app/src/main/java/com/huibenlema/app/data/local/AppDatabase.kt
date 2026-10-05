@@ -30,7 +30,7 @@ import com.huibenlema.app.data.local.entity.SyncLogEntity
         SyncLogEntity::class,
         DailyBookStatEntity::class
     ],
-    version = 4,
+    version = 6,
     exportSchema = false
 )
 @TypeConverters(Converters::class)
@@ -56,6 +56,20 @@ abstract class AppDatabase : RoomDatabase() {
                     "CREATE UNIQUE INDEX IF NOT EXISTS index_daily_book_stats_date_bookId " +
                         "ON daily_book_stats (date, bookId)"
                 )
+            }
+        }
+
+        /** v4 → v5：books 表新增 hidden 列（用户手动隐藏书籍，升级不清数据） */
+        val MIGRATION_4_5 = object : Migration(4, 5) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE books ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0")
+            }
+        }
+
+        /** v5 → v6：books 表新增 progressManual 列（手动调节进度的「手动」标记，升级不清数据） */
+        val MIGRATION_5_6 = object : Migration(5, 6) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE books ADD COLUMN progressManual INTEGER NOT NULL DEFAULT 0")
             }
         }
     }

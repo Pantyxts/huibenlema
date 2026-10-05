@@ -25,8 +25,10 @@ fun BookEntity.toDomain() = Book(
     finished = finished,
     totalReadSeconds = totalReadSeconds,
     lastReadAt = lastReadAt,
+    progressManual = progressManual,
     onShelf = onShelf,
-    removed = removed
+    removed = removed,
+    hidden = hidden
 )
 
 fun Book.toEntity(now: Long = System.currentTimeMillis()) = BookEntity(
@@ -45,8 +47,10 @@ fun Book.toEntity(now: Long = System.currentTimeMillis()) = BookEntity(
     finished = finished,
     totalReadSeconds = totalReadSeconds,
     lastReadAt = lastReadAt,
+    progressManual = progressManual,
     onShelf = onShelf,
     removed = false,
+    hidden = false,
     createdAt = now,
     updatedAt = now
 )

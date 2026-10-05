@@ -28,8 +28,11 @@ import com.huibenlema.app.domain.model.BookDayStat
 import com.huibenlema.app.domain.model.CostItem
 import com.huibenlema.app.domain.model.DailyStat
 import com.huibenlema.app.domain.model.PaybackSummary
+import com.huibenlema.app.domain.repo.BatchPriceResult
+import com.huibenlema.app.domain.repo.BatchProgressResult
 import com.huibenlema.app.domain.repo.BookRepository
 import com.huibenlema.app.domain.repo.ResyncPriceResult
+import com.huibenlema.app.domain.repo.ResyncProgressResult
 import com.huibenlema.app.domain.repo.SyncResult
 import java.time.LocalDate
 import dagger.hilt.android.qualifiers.ApplicationContext
@@ -44,6 +47,8 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
@@ -99,16 +104,29 @@ class BookRepositoryImpl @Inject constructor(
         bookDao.observeShelfBooks().map { list -> list.map { it.toDomain() } }
 
     override fun observeReadBooks(): Flow<List<Book>> =
-        bookDao.observeReadBooks().map { list -> list.map { it.toDomain() } }
+        bookDao.observeReadBooks()
+            .distinctUntilChanged()
+            .map { list -> list.map { it.toDomain() } }
+            // 万本量级的转换/排序放 Default 线程，避免同步风暴时阻塞主线程
+            .flowOn(Dispatchers.Default)
+
+    override fun observeHiddenBooks(): Flow<List<Book>> =
+        bookDao.observeHiddenBooks()
+            .distinctUntilChanged()
+            .map { list -> list.map { it.toDomain() } }
+            .flowOn(Dispatchers.Default)
 
     /** 回本总价值：读过的书（含已移出书架的） */
     override fun observeSummary(): Flow<PaybackSummary> =
-        combine(bookDao.observeReadBooks(), costItemDao.observeAll()) { books, costs ->
+        combine(
+            bookDao.observeReadBooks().distinctUntilChanged(),
+            costItemDao.observeAll()
+        ) { books, costs ->
             PaybackCalculator.compute(
                 books = books.map { it.toDomain() },
                 costs = costs.map { it.toDomain() }
             )
-        }
+        }.flowOn(Dispatchers.Default)
 
     override fun observeDailyStats(days: Int): Flow<List<DailyStat>> {
         val from = LocalDate.now().minusDays(days - 1L).toString()
@@ -135,8 +153,9 @@ class BookRepositoryImpl @Inject constructor(
     override suspend fun saveOfficialPrice(bookId: String, priceFen: Long) =
         bookDao.updatePriceForce(bookId, priceFen, PriceSource.WEREAD, System.currentTimeMillis())
 
-    override suspend fun addCustomBook(title: String, author: String, priceFen: Long?) {
+    override suspend fun addCustomBook(title: String, author: String, priceFen: Long?, progressPct: Int) {
         val now = System.currentTimeMillis()
+        val progress = (progressPct.coerceIn(0, 100)) / 100.0
         // CUSTOM_ 前缀 + 时间戳保证唯一；onShelf=false 使同步书架/进度/补价逻辑完全跳过本记录
         bookDao.upsertAll(
             listOf(
@@ -146,8 +165,8 @@ class BookRepositoryImpl @Inject constructor(
                     author = author,
                     priceFen = priceFen ?: 0L,
                     priceSource = if (priceFen != null && priceFen > 0) PriceSource.MANUAL else PriceSource.NONE,
-                    progress = 1.0,
-                    finished = true,
+                    progress = progress,
+                    finished = progress >= 1.0,
                     onShelf = false,
                     removed = true,
                     createdAt = now,
@@ -155,6 +174,64 @@ class BookRepositoryImpl @Inject constructor(
                 )
             )
         )
+    }
+
+    override suspend fun updateBookProgress(bookId: String, progressPct: Int) =
+        bookDao.updateBookProgress(
+            bookId = bookId,
+            progress = progressPct.coerceIn(0, 100) / 100.0,
+            finished = progressPct >= 100,
+            ts = System.currentTimeMillis()
+        )
+
+    override suspend fun setBookHidden(bookId: String, hidden: Boolean) =
+        bookDao.setHidden(bookId, hidden, System.currentTimeMillis())
+
+    override suspend fun markBooksFinished(bookIds: List<String>) {
+        // 分批执行：SQLite 单语句参数上限（老设备 999），万本全选也不越界
+        val now = System.currentTimeMillis()
+        bookIds.chunked(500).forEach { bookDao.markFinishedBatch(it, now) }
+    }
+
+    override suspend fun setBooksHidden(bookIds: List<String>, hidden: Boolean) {
+        val now = System.currentTimeMillis()
+        bookIds.chunked(500).forEach { bookDao.setHiddenBatch(it, hidden, now) }
+    }
+
+    override suspend fun deleteBooks(bookIds: List<String>) {
+        bookIds.chunked(500).forEach { bookDao.deleteCustomBatch(it) }
+    }
+
+    override suspend fun resyncBooksPrice(
+        bookIds: List<String>,
+        onProgress: (done: Int, total: Int) -> Unit
+    ): BatchPriceResult {
+        val key = credentials.apiKey()
+        if (key == null) {
+            val titles = bookDao.getTitlesByIds(bookIds)
+            return BatchPriceResult(
+                okCount = 0,
+                failedCount = bookIds.size,
+                failedBooks = bookIds.map { it to (titles[it] ?: "未知书名") }
+            )
+        }
+        return syncManager.resyncBooksPrice(bookIds, key, credentials.cookie(), onProgress)
+    }
+
+    override suspend fun resyncBooksProgress(
+        bookIds: List<String>,
+        onProgress: (done: Int, total: Int) -> Unit
+    ): BatchProgressResult {
+        val key = credentials.apiKey()
+        if (key == null) {
+            val titles = bookDao.getTitlesByIds(bookIds)
+            return BatchProgressResult(
+                okCount = 0,
+                failedCount = bookIds.size,
+                failedBooks = bookIds.map { it to (titles[it] ?: "未知书名") }
+            )
+        }
+        return syncManager.resyncBooksProgress(bookIds, key, onProgress)
     }
 
     override suspend fun deleteBook(bookId: String) = bookDao.deleteBook(bookId)
@@ -171,6 +248,14 @@ class BookRepositoryImpl @Inject constructor(
         val key = credentials.apiKey() ?: return ResyncPriceResult.NoCredential
         return syncManager.resyncBookPrice(bookId, key, credentials.cookie())
     }
+
+    override suspend fun resyncBookProgress(bookId: String): ResyncProgressResult {
+        val key = credentials.apiKey() ?: return ResyncProgressResult.NoCredential
+        return syncManager.resyncBookProgress(bookId, key)
+    }
+
+    override suspend fun saveRestoredProgress(bookId: String, progressPct: Int) =
+        syncManager.applyRestoredProgress(bookId, progressPct)
 
     override suspend fun getDailyBookStats(date: String): List<BookDayStat> =
         dailyBookStatDao.getForDate(date).map {
@@ -231,7 +316,9 @@ class BookRepositoryImpl @Inject constructor(
                     progress = e.progress,
                     totalReadSeconds = e.totalReadSeconds,
                     onShelf = e.onShelf,
-                    removed = e.removed
+                    removed = e.removed,
+                    hidden = e.hidden,
+                    progressManual = e.progressManual
                 )
             }
             val costs = costItemDao.getAllOnce().map { e ->
@@ -285,6 +372,8 @@ class BookRepositoryImpl @Inject constructor(
                     totalReadSeconds = b.totalReadSeconds,
                     onShelf = b.onShelf,
                     removed = b.removed,
+                    hidden = b.hidden,
+                    progressManual = b.progressManual,
                     createdAt = now,
                     updatedAt = now
                 )

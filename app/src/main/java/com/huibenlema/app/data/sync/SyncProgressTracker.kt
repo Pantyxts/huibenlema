@@ -21,4 +21,9 @@ class SyncProgressTracker @Inject constructor() {
     fun update(percent: Int, label: String) {
         _state.value = SyncProgress(percent.coerceIn(0, 100), label)
     }
+
+    /** 仅更新阶段文案（保持当前百分比，限流等待提示用） */
+    fun updateLabel(label: String) {
+        _state.value = _state.value.copy(label = label)
+    }
 }

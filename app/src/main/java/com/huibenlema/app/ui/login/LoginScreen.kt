@@ -157,7 +157,8 @@ fun LoginScreen(
             Text("微信扫码登录微信读书", style = MaterialTheme.typography.titleMedium)
         }
         Text(
-            "页面加载后会自动弹出登录二维码。若未弹出，请点击网页「登录」；微信扫码确认后自动完成。",
+            "页面加载后会自动弹出登录二维码（过期会自动刷新）。若未弹出，请点击网页「登录」；" +
+                "微信扫码后请尽快确认，确认成功自动完成登录。",
             style = MaterialTheme.typography.bodySmall,
             color = GrayDark,
             modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp)
@@ -172,7 +173,11 @@ fun LoginScreen(
                     webViewClient = object : WebViewClient() {
                         override fun onPageFinished(view: WebView?, url: String?) {
                             super.onPageFinished(view, url)
-                            view?.let { injectAutoLoginClick(it) }
+                            view?.let {
+                                injectAutoLoginClick(it)
+                                // 二维码过期时自动点击「刷新二维码」，避免用户卡在失效页面
+                                injectAutoRefreshQr(it)
+                            }
                             vm.onPageFinished(getWereadCookie(ctx))
                         }
                     }
@@ -194,20 +199,57 @@ private fun injectAutoLoginClick(view: WebView) {
     val js = """
         (function() {
           var tries = 0;
+          var done = false;
+          // 登录弹窗已打开（存在微信二维码 iframe）则不再点击「登录」，
+          // 避免重复点击导致二维码被刷新、用户扫到旧码
+          function qrOpened() {
+            var iframes = document.querySelectorAll('iframe');
+            for (var i = 0; i < iframes.length; i++) {
+              if ((iframes[i].src || '').indexOf('open.weixin.qq.com') >= 0) return true;
+            }
+            return false;
+          }
           function clickLogin() {
             tries++;
-            if (tries > 15) return;
+            if (tries > 15 || done) return;
+            if (qrOpened()) { done = true; return; }
             var els = document.querySelectorAll('a,button,div,span');
             for (var i = 0; i < els.length; i++) {
               var t = (els[i].textContent || '').trim();
               if (t === '登录' && els[i].offsetParent !== null) {
                 els[i].click();
+                done = true;
                 return;
               }
             }
             setTimeout(clickLogin, 800);
           }
           setTimeout(clickLogin, 800);
+        })();
+    """.trimIndent()
+    view.evaluateJavascript(js, null)
+}
+
+/**
+ * 二维码有效期短（用户扫码确认稍慢就会过期），定期检测失效提示
+ * （「点击刷新二维码」/「二维码已失效」）并自动点击刷新，保证随时扫到的都是有效二维码。
+ */
+private fun injectAutoRefreshQr(view: WebView) {
+    val js = """
+        (function() {
+          if (window.__hbRefreshQr) return; // onPageFinished 可能多次触发，防止重复注入
+          window.__hbRefreshQr = true;
+          setInterval(function() {
+            var els = document.querySelectorAll('a,button,div,span');
+            for (var i = 0; i < els.length; i++) {
+              var t = (els[i].textContent || '').trim();
+              if ((t.indexOf('点击刷新二维码') >= 0 || t.indexOf('二维码已失效') >= 0) &&
+                  els[i].offsetParent !== null) {
+                els[i].click();
+                break;
+              }
+            }
+          }, 1500);
         })();
     """.trimIndent()
     view.evaluateJavascript(js, null)

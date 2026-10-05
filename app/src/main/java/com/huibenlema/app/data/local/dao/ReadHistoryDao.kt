@@ -17,6 +17,13 @@ interface ReadHistoryDao {
     @Query("SELECT * FROM read_history WHERE bookId = :bookId ORDER BY date ASC")
     suspend fun getAllForBook(bookId: String): List<ReadHistoryEntity>
 
+    /** 全部有价书的进度快照（一次查询替代逐本查询，本地重建每日价值用） */
+    @Query(
+        "SELECT rh.* FROM read_history rh INNER JOIN books b ON rh.bookId = b.bookId " +
+            "WHERE b.priceFen > 0 ORDER BY rh.bookId ASC, rh.date ASC"
+    )
+    suspend fun getAllValuedBooks(): List<ReadHistoryEntity>
+
     @Upsert
     suspend fun upsertAll(rows: List<ReadHistoryEntity>)
 

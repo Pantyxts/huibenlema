@@ -35,10 +35,17 @@ import java.time.LocalDate
 import dagger.hilt.android.qualifiers.ApplicationContext
 import javax.inject.Inject
 import javax.inject.Singleton
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.asSharedFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -62,7 +69,31 @@ class BookRepositoryImpl @Inject constructor(
     /** 同步互斥锁：手动同步 / 启动自动同步 / 周期任务并发时串行执行 */
     private val syncMutex = Mutex()
 
+    /** 后台同步 scope：独立于页面 ViewModel，跨页面不取消 */
+    private val appScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    /** 后台同步请求去重：排队中/执行中都算已请求，双击与多入口重复触发只执行一次 */
+    private val syncRequested = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    private val _syncing = MutableStateFlow(false)
+    override val syncing: Flow<Boolean> = _syncing.asStateFlow()
+
+    private val _lastSyncResult = MutableSharedFlow<SyncResult>(extraBufferCapacity = 8)
+    override val lastSyncResult: Flow<SyncResult> = _lastSyncResult.asSharedFlow()
+
     override val syncProgress: Flow<SyncProgress> = progressTracker.state
+
+    override fun syncInBackground() {
+        // 原子去重：同步排队/执行期间重复触发（双击、引导页+首页自动同步并发）只执行一次
+        if (!syncRequested.compareAndSet(false, true)) return
+        appScope.launch {
+            try {
+                sync()
+            } finally {
+                syncRequested.set(false)
+            }
+        }
+    }
 
     override fun observeShelfBooks(): Flow<List<Book>> =
         bookDao.observeShelfBooks().map { list -> list.map { it.toDomain() } }
@@ -104,6 +135,30 @@ class BookRepositoryImpl @Inject constructor(
     override suspend fun saveOfficialPrice(bookId: String, priceFen: Long) =
         bookDao.updatePriceForce(bookId, priceFen, PriceSource.WEREAD, System.currentTimeMillis())
 
+    override suspend fun addCustomBook(title: String, author: String, priceFen: Long?) {
+        val now = System.currentTimeMillis()
+        // CUSTOM_ 前缀 + 时间戳保证唯一；onShelf=false 使同步书架/进度/补价逻辑完全跳过本记录
+        bookDao.upsertAll(
+            listOf(
+                BookEntity(
+                    bookId = "CUSTOM_$now",
+                    title = title,
+                    author = author,
+                    priceFen = priceFen ?: 0L,
+                    priceSource = if (priceFen != null && priceFen > 0) PriceSource.MANUAL else PriceSource.NONE,
+                    progress = 1.0,
+                    finished = true,
+                    onShelf = false,
+                    removed = true,
+                    createdAt = now,
+                    updatedAt = now
+                )
+            )
+        )
+    }
+
+    override suspend fun deleteBook(bookId: String) = bookDao.deleteBook(bookId)
+
     override suspend fun clearAllBooks() = bookDao.deleteAllBooks()
 
     override suspend fun clearNonManualBooks() = bookDao.deleteNonManualBooks()
@@ -123,6 +178,15 @@ class BookRepositoryImpl @Inject constructor(
         }
 
     override suspend fun sync(): SyncResult = syncMutex.withLock {
+        _syncing.value = true
+        try {
+            doSync().also { _lastSyncResult.tryEmit(it) }
+        } finally {
+            _syncing.value = false
+        }
+    }
+
+    private suspend fun doSync(): SyncResult {
         // 自愈：已保存 Cookie 缺会话密钥时，从 WebView Cookie 存储补取最新值
         val saved = credentials.cookie()
         val cookie = if (saved.isNullOrBlank() || !saved.contains("wr_skey")) {

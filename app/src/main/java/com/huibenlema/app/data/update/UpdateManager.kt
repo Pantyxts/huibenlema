@@ -4,6 +4,7 @@ import android.content.Context
 import android.content.Intent
 import androidx.core.content.FileProvider
 import com.huibenlema.app.BuildConfig
+import com.huibenlema.app.data.local.UserPrefs
 import com.huibenlema.app.data.remote.lng
 import com.huibenlema.app.data.remote.str
 import dagger.hilt.android.qualifiers.ApplicationContext
@@ -15,6 +16,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
@@ -35,7 +37,8 @@ data class UpdateInfo(
  */
 @Singleton
 class UpdateManager @Inject constructor(
-    @ApplicationContext private val context: Context
+    @ApplicationContext private val context: Context,
+    private val prefs: UserPrefs
 ) {
 
     sealed class UpdateState {
@@ -64,11 +67,11 @@ class UpdateManager @Inject constructor(
         .readTimeout(120, TimeUnit.SECONDS)
         .build()
 
-    /** 手动检查：更新 UI 状态 */
+    /** 手动检查：更新 UI 状态（忽略的版本也如实提示，用户可重新决定） */
     suspend fun checkUpdate(): UpdateInfo? {
         _state.value = UpdateState.Checking
         return try {
-            val info = checkUpdateSilent()
+            val info = checkUpdateSilent(respectIgnored = false)
             when {
                 info == null && _state.value == UpdateState.Checking ->
                     _state.value = UpdateState.NoUpdate
@@ -81,8 +84,8 @@ class UpdateManager @Inject constructor(
         }
     }
 
-    /** 静默检查（启动自动检查用，不改 UI 状态） */
-    suspend fun checkUpdateSilent(): UpdateInfo? = withContext(Dispatchers.IO) {
+    /** 静默检查（启动自动检查用，不改 UI 状态）；respectIgnored=true 时跳过已忽略的版本 */
+    suspend fun checkUpdateSilent(respectIgnored: Boolean = true): UpdateInfo? = withContext(Dispatchers.IO) {
         val req = Request.Builder()
             .url("https://api.github.com/repos/Pantyxts/huibenlema/releases/latest")
             .header("Accept", "application/vnd.github+json")
@@ -104,6 +107,11 @@ class UpdateManager @Inject constructor(
                 downloadUrl = url,
                 releaseNotes = json.str("body")
             )
+            // 自动检查：已忽略的版本不再通知（更高版本自然恢复通知）；手动检查不受影响
+            if (respectIgnored) {
+                val ignored = prefs.ignoredUpdateVersion.first()
+                if (info.versionName == ignored) return@withContext null
+            }
             if (isNewer(info.versionName, BuildConfig.VERSION_NAME)) info else null
         }
     }

@@ -85,7 +85,7 @@ class SyncManager @Inject constructor(
             is GatewayResult.UpgradeRequired -> return SyncResult.UpgradeRequired(r.message)
         }
 
-        tracker.update(10, "书架已获取")
+        tracker.update(10, "获取书架完成")
 
         // 2. upsert 书架（保留已有价格/进度/快照时间）
         val existing = bookDao.getShelfBooksOnce().associateBy { it.bookId }
@@ -175,7 +175,7 @@ class SyncManager @Inject constructor(
             if (!batchHandled) {
                 var failed = 0
                 for ((idx, b) in unpriced.withIndex()) {
-                    tracker.update(15 + (idx + 1) * 35 / unpriced.size, "补价中 ${idx + 1}/${unpriced.size}")
+                    tracker.update(15 + (idx + 1) * 35 / unpriced.size, "获取书籍价格 ${idx + 1}/${unpriced.size}")
                     if (idx > 0) delay(PRICE_FETCH_THROTTLE_MS)
                     val fen = fetchPriceFenViaPrivate(b.bookId, cookie)
                     if (fen == null) {
@@ -200,7 +200,7 @@ class SyncManager @Inject constructor(
             val local = booksAfter[sb.bookId] ?: return@filter true
             !(local.progressFetchedAt > 0 && local.progressFetchedAt >= sb.readUpdateTime)
         }
-        tracker.update(50, "同步进度 0/${needList.size}")
+        tracker.update(50, "获取阅读进度 0/${needList.size}")
         for ((idx, sb) in needList.withIndex()) {
             val local = booksAfter[sb.bookId] ?: continue
 
@@ -209,7 +209,7 @@ class SyncManager @Inject constructor(
                 is GatewayResult.Err -> continue // 单本失败跳过
                 is GatewayResult.UpgradeRequired -> return SyncResult.UpgradeRequired(r.message)
             }
-            tracker.update(50 + (idx + 1) * 40 / needList.size, "同步进度 ${idx + 1}/${needList.size}")
+            tracker.update(50 + (idx + 1) * 40 / needList.size, "获取阅读进度 ${idx + 1}/${needList.size}")
 
             bookDao.updateProgress(
                 bookId = sb.bookId,
@@ -227,15 +227,15 @@ class SyncManager @Inject constructor(
 
         // 6. readdata 回溯（提供按日权重；顺带收集时长榜书单）
         val longestBooks = backfillReadSeconds(key, today)
-        tracker.update(90, "统计回溯完成")
+        tracker.update(91, "阅读统计获取完成")
 
         // 6.5 补捞读完移出书架的书（readLongest 与书架状态无关）
         fetchLongestBooks(key, cookie, longestBooks, now)
-        tracker.update(92, "补捞完成")
+        tracker.update(92, "已移出书架书籍获取完成")
 
         // 7. 本地重建每日价值（含逐书明细；幂等，定价变化与历史数据都能正确反映）
         rebuildDailyValues(today)
-        tracker.update(97, "价值重建完成")
+        tracker.update(97, "计算回本价值完成")
 
         val booksFinal = bookDao.getShelfBooksOnce()
         val totalValueFen = booksFinal.sumOf { (it.progress * it.priceFen).toLong() }
@@ -283,16 +283,26 @@ class SyncManager @Inject constructor(
      * 私有通道单本取价（分）：网页版优先、子域兜底。
      * 单本异常/无价/0 元返回 null，不抛出——批量补价时单本失败不阻塞后续。
      */
-    private suspend fun fetchPriceFenViaPrivate(bookId: String, cookie: String): Long? {
+    private suspend fun fetchPriceFenViaPrivate(bookId: String, cookie: String): Long? =
+        fetchPrivateMeta(bookId, cookie).priceFen
+
+    /** 私有单书接口查询（网页版优先、子域兜底）：价格 + 作者，一次请求两者同取 */
+    private suspend fun fetchPrivateMeta(bookId: String, cookie: String): PrivateBookMeta {
         val web = runCatching { privateApi.webBookInfo(bookId, cookie, REFERER) }.getOrNull()
         if (web != null && web.lng("errcode") == 0L && web.lng("errCode") == 0L) {
-            web.priceFenOrNull()?.takeIf { it > 0 }?.let { return it }
+            return PrivateBookMeta(web.priceFenOrNull()?.takeIf { it > 0 }, web.pickAuthor())
         }
         val sub = runCatching { privateApi.bookInfo(bookId, cookie) }.getOrNull()
         if (sub != null && sub.lng("errcode") == 0L) {
-            sub.priceFenOrNull()?.takeIf { it > 0 }?.let { return it }
+            return PrivateBookMeta(sub.priceFenOrNull()?.takeIf { it > 0 }, sub.pickAuthor())
         }
-        return null
+        return PrivateBookMeta(null, "")
+    }
+
+    /** 作者字段可能在顶层，也可能包在 data 层（网页版/子域结构不完全一致） */
+    private fun JsonObject.pickAuthor(): String {
+        str("author").takeIf { it.isNotBlank() }?.let { return it }
+        return (this["data"] as? JsonObject)?.str("author") ?: ""
     }
 
     /** 尽力获取登录账号昵称（私有接口，失败不影响同步） */
@@ -323,17 +333,27 @@ class SyncManager @Inject constructor(
 
     /**
      * readdata 历史回溯：本月总是刷新；历史月份有数据则跳过。
-     * 最多回溯 12 个月；连续空月提前终止。
+     * 最多回溯 144 个月（12 年，覆盖微信读书 2015 年上线以来全部历史）；
+     * 连续 6 个空月提前终止（用户长期未读才停止，中途断档不影响）；
+     * 注册时间之前的月份直接停止。
      */
     /** @return readLongest 时长榜书单（去重，供补捞读完移出书架的书） */
     private suspend fun backfillReadSeconds(key: String, today: LocalDate): List<LongestBookDto> {
         val zone = ZoneId.systemDefault()
         val currentMonth = today.withDayOfMonth(1)
         val longest = mutableMapOf<String, LongestBookDto>()
+        var emptyStreak = 0
         for (offset in 0..BACKFILL_MONTHS) {
             val monthStart = currentMonth.minusMonths(offset.toLong())
             val prefix = monthStart.toString().take(7)
-            if (offset > 0 && dailyStatDao.hasReadSecondsInMonth(prefix) > 0) continue
+            if (offset > 0 && dailyStatDao.hasReadSecondsInMonth(prefix) > 0) {
+                emptyStreak = 0 // 该月有本地阅读数据，非空月
+                continue
+            }
+            // 注册时间之前的整月无阅读数据，直接停止（避免为空历史浪费请求）
+            val regist = prefs.registTime.first()
+            if (regist > 0 && monthStart.plusMonths(1).atStartOfDay(zone).toEpochSecond() <= regist) break
+            tracker.update(90, "获取阅读统计 ${offset + 1}/${BACKFILL_MONTHS + 1}")
 
             val baseTime = monthStart.atStartOfDay(zone).toEpochSecond()
             val r = client.readMonthly(key, baseTime)
@@ -341,7 +361,12 @@ class SyncManager @Inject constructor(
                 if (offset > 0) break
                 continue
             }
-            if (r.data.dailySeconds.isEmpty() && offset > 0) break
+            if (r.data.dailySeconds.isEmpty() && offset > 0) {
+                emptyStreak++
+                if (emptyStreak >= EMPTY_MONTHS_LIMIT) break
+                continue
+            }
+            emptyStreak = 0
             // 注册时间（账号特性标识，随当前月份响应一起返回）
             if (r.data.registTime > 0 && prefs.registTime.first() == 0L) {
                 prefs.setRegistTime(r.data.registTime)
@@ -374,7 +399,10 @@ class SyncManager @Inject constructor(
         longest: List<LongestBookDto>,
         now: Long
     ) {
-        for (lb in longest) {
+        for ((idx, lb) in longest.withIndex()) {
+            if (idx > 0) delay(PRICE_FETCH_THROTTLE_MS) // 补捞书多时节流防限流
+            // 补捞逐本进度（含补进度与补价，避免进度条冻结在"统计回溯完成"）
+            tracker.update(91 + (idx + 1) / longest.size, "获取已移出书架书籍信息 ${idx + 1}/${longest.size}")
             if (bookDao.getById(lb.bookId) != null) continue
             bookDao.upsertAll(
                 listOf(
@@ -404,10 +432,14 @@ class SyncManager @Inject constructor(
                 is GatewayResult.UpgradeRequired -> return
             }
             if (!cookie.isNullOrBlank()) {
-                val fen = fetchPriceFenViaPrivate(lb.bookId, cookie)
-                if (fen != null) {
-                    bookDao.updatePrice(lb.bookId, fen, PriceSource.WEREAD, now)
-                    cachePrice(lb.bookId, fen, now)
+                val meta = fetchPrivateMeta(lb.bookId, cookie)
+                // 补捞书补作者（书值页正常显示作者，替代「已移出书架」标注）
+                if (meta.author.isNotBlank()) {
+                    bookDao.updateAuthorIfBlank(lb.bookId, meta.author, now)
+                }
+                if (meta.priceFen != null) {
+                    bookDao.updatePrice(lb.bookId, meta.priceFen, PriceSource.WEREAD, now)
+                    cachePrice(lb.bookId, meta.priceFen, now)
                 }
             }
         }
@@ -505,6 +537,8 @@ class SyncManager @Inject constructor(
 
     private data class ValueDelta(val bookId: String, val valueFen: Long, val fromDate: LocalDate)
 
+    private data class PrivateBookMeta(val priceFen: Long?, val author: String)
+
     private fun windowStart(today: LocalDate): LocalDate = today.minusMonths(BACKFILL_MONTHS + 1L)
 
     companion object {
@@ -514,8 +548,11 @@ class SyncManager @Inject constructor(
         private const val MAX_PRICE_FETCH = 200
         /** 逐本补价节流（防微信读书接口限流） */
         private const val PRICE_FETCH_THROTTLE_MS = 400L
-        /** 历史回溯月数 */
-        private const val BACKFILL_MONTHS = 12
+        /** 历史回溯月数（12 年：覆盖微信读书 2015 年上线至今的全部历史；
+         * 注册时间与连续 6 个空月会提前终止，近期用户不会跑满） */
+        private const val BACKFILL_MONTHS = 144
+        /** 连续空月终止阈值：连续 6 个月无阅读数据才停止向前回溯 */
+        private const val EMPTY_MONTHS_LIMIT = 6
         /** 网页版接口 Referer */
         private const val REFERER = "https://weread.qq.com/"
     }

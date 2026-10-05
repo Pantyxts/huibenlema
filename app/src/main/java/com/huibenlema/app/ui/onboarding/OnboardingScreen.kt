@@ -24,7 +24,6 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.huibenlema.app.ui.components.EinkButton
 import com.huibenlema.app.ui.login.LoginScreen
 import com.huibenlema.app.ui.theme.GrayDark
-import com.huibenlema.app.ui.theme.InkBlack
 
 /** 引导页：设备价格 + 微信扫码登录 + 官方 API Key 授权（首次启动） */
 @Composable
@@ -70,18 +69,8 @@ fun OnboardingScreen(vm: OnboardingViewModel = hiltViewModel()) {
         )
         Spacer(Modifier.height(20.dp))
 
-        vm.error?.let {
-            Text(
-                it,
-                style = MaterialTheme.typography.bodyMedium,
-                fontWeight = FontWeight.Bold,
-                color = InkBlack
-            )
-            Spacer(Modifier.height(8.dp))
-        }
-
         EinkButton(
-            text = if (vm.working) "同步中…（首次需约 1 分钟）" else "开始使用",
+            text = "开始使用",
             onClick = vm::start,
             enabled = !vm.working,
             modifier = Modifier.fillMaxWidth()

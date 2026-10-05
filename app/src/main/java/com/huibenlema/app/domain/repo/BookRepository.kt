@@ -68,6 +68,15 @@ interface BookRepository {
     /** 同步进度（0-100 + 阶段说明） */
     val syncProgress: Flow<SyncProgress>
 
+    /** 同步进行中（任何入口触发的同步，含引导页启动的后台同步） */
+    val syncing: Flow<Boolean>
+
+    /** 每次同步完成后的结果（手动/自动/后台统一经此反馈，无回放） */
+    val lastSyncResult: Flow<SyncResult>
+
+    /** 后台同步：app 级 scope 执行，跨页面不取消 */
+    fun syncInBackground()
+
     suspend fun addCostItem(item: CostItem): Long
 
     suspend fun updateCostItem(item: CostItem)
@@ -78,6 +87,16 @@ interface BookRepository {
 
     /** 保存官方同步价（编辑页「同步官方价格」后点保存；WEREAD 来源） */
     suspend fun saveOfficialPrice(bookId: String, priceFen: Long)
+
+    /**
+     * 添加自定义书籍（手动录入，不在微信读书书架）：
+     * 视为已读完（progress=1.0）全额计入价值；定价可空（未定价）；
+     * priceFen>0 时来源 MANUAL，自动同步不覆盖。
+     */
+    suspend fun addCustomBook(title: String, author: String, priceFen: Long?)
+
+    /** 删除单本（仅手动添加的自定义书籍入口使用） */
+    suspend fun deleteBook(bookId: String)
 
     /** 单书重新同步微信读书官方价格（覆盖手动价） */
     suspend fun resyncOfficialPrice(bookId: String): ResyncPriceResult

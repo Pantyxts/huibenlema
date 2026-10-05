@@ -38,6 +38,28 @@ class SettingsViewModel @Inject constructor(
     private val updateManager: UpdateManager
 ) : ViewModel() {
 
+    init {
+        // 同步结果统一反馈（手动/自动/后台/周期任务）
+        viewModelScope.launch {
+            repo.lastSyncResult.collect { r ->
+                message = when (r) {
+                    is SyncResult.Success -> buildString {
+                        append("共导入书籍 ${r.bookCount} 本，获取价格成功 ${r.pricedCount} 本，" +
+                            "获取价格失败 ${r.unpricedCount} 本")
+                        append("\n（自导入书籍无官方价格，显示为 0 元）")
+                        r.priceWarning?.let { append("\n$it") }
+                    }
+                    SyncResult.NoCredential -> "尚未登录，请先扫码登录"
+                    SyncResult.AuthFailed -> "凭证已失效，请重新扫码登录"
+                    SyncResult.RateLimited -> "请求过于频繁，请稍后再试"
+                    SyncResult.NetworkError -> "无网络连接，请检查网络后重试"
+                    is SyncResult.Failure -> "同步失败：${r.message}"
+                    is SyncResult.UpgradeRequired -> r.message
+                }
+            }
+        }
+    }
+
     // ---- 自动更新 ----
 
     val updateState = updateManager.state
@@ -58,6 +80,17 @@ class SettingsViewModel @Inject constructor(
 
     fun dismissUpdate() {
         updateManager.reset()
+    }
+
+    /** 忽略此版本：该版本不再通知（含首页横幅与后续检查），更高版本正常通知 */
+    fun ignoreUpdate() {
+        val st = updateState.value as? UpdateManager.UpdateState.Available ?: return
+        viewModelScope.launch {
+            prefs.setIgnoredUpdateVersion(st.info.versionName)
+            prefs.setPendingUpdateVersion(null)
+            updateManager.reset()
+            message = "已忽略 v${st.info.versionName} 的更新"
+        }
     }
 
     /** 进入设置页后清除首页"发现新版本"横幅 */
@@ -101,7 +134,11 @@ class SettingsViewModel @Inject constructor(
     var showClearConfirm by mutableStateOf(false)
         private set
     var message by mutableStateOf<String?>(null)
-    var syncing by mutableStateOf(false)
+
+    /** 同步进行中（全局状态：引导页后台同步、手动同步、自动同步均反映） */
+    val syncing: StateFlow<Boolean> = repo.syncing
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), false)
+
     var showLogin by mutableStateOf(false)
         private set
 
@@ -289,26 +326,10 @@ class SettingsViewModel @Inject constructor(
         }
     }
 
+    /** 手动同步：后台执行（app 级 scope），进度与结果经全局流反馈 */
     fun sync() {
-        if (syncing) return
-        viewModelScope.launch {
-            syncing = true
-            message = when (val r = repo.sync()) {
-                is SyncResult.Success -> buildString {
-                    append("共导入书籍 ${r.bookCount} 本，获取价格成功 ${r.pricedCount} 本，" +
-                        "获取价格失败 ${r.unpricedCount} 本")
-                    append("\n（自导入书籍无官方价格，显示为 0 元）")
-                    r.priceWarning?.let { append("\n$it") }
-                }
-                SyncResult.NoCredential -> "尚未登录，请先扫码登录"
-                SyncResult.AuthFailed -> "凭证已失效，请重新扫码登录"
-                SyncResult.RateLimited -> "请求过于频繁，请稍后再试"
-                SyncResult.NetworkError -> "无网络连接，请检查网络后重试"
-                is SyncResult.Failure -> "同步失败：${r.message}"
-                is SyncResult.UpgradeRequired -> r.message
-            }
-            syncing = false
-        }
+        if (syncing.value) return
+        repo.syncInBackground()
     }
 
     /** 导出前确认框（进入系统保存框前提供明确的取消入口） */

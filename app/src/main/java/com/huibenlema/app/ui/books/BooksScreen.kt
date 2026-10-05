@@ -14,6 +14,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.lazy.LazyColumn
@@ -58,8 +59,10 @@ import kotlinx.coroutines.launch
 fun BooksScreen(vm: BooksViewModel = hiltViewModel()) {
     val books by vm.books.collectAsStateWithLifecycle()
     val sortState by vm.sortState.collectAsStateWithLifecycle()
+    val shelfFilter by vm.shelfFilterState.collectAsStateWithLifecycle()
     val totalValueFen by vm.totalValueFen.collectAsStateWithLifecycle()
     var editing by remember { mutableStateOf<Book?>(null) }
+    var addVisible by remember { mutableStateOf(false) }
     val listState = rememberLazyListState()
     // 切换排序（含升降序）后回到列表顶部
     LaunchedEffect(sortState) { listState.scrollToItem(0) }
@@ -84,25 +87,42 @@ fun BooksScreen(vm: BooksViewModel = hiltViewModel()) {
         }
         Spacer(Modifier.height(8.dp))
         val arrow = if (sortState.ascending) "↑" else "↓"
-        // 一行排列：排序片 + 右侧筛选片（可横向滑动）；箭头只显示在当前排序维度上
+        // 一行排列：排序片（可横向滑动）+ 添加书籍 + 书架筛选片固定右顶格；箭头只显示在当前排序维度上
         Row(
-            Modifier
-                .fillMaxWidth()
-                .horizontalScroll(rememberScrollState()),
-            horizontalArrangement = Arrangement.spacedBy(4.dp)
+            Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically
         ) {
+            Row(
+                Modifier
+                    .weight(1f)
+                    .horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(4.dp)
+            ) {
+                EinkChip(
+                    label = if (sortState.key == BookSort.VALUE) "价值 $arrow" else "价值",
+                    selected = sortState.key == BookSort.VALUE
+                ) { vm.toggleSort(BookSort.VALUE) }
+                EinkChip(
+                    label = if (sortState.key == BookSort.PROGRESS) "进度 $arrow" else "进度",
+                    selected = sortState.key == BookSort.PROGRESS
+                ) { vm.toggleSort(BookSort.PROGRESS) }
+                EinkChip(
+                    label = if (sortState.key == BookSort.PRICE) "定价 $arrow" else "定价",
+                    selected = sortState.key == BookSort.PRICE
+                ) { vm.toggleSort(BookSort.PRICE) }
+            }
+            Spacer(Modifier.width(4.dp))
+            // 添加书籍（恒黑框）
             EinkChip(
-                label = if (sortState.key == BookSort.VALUE) "价值 $arrow" else "价值",
-                selected = sortState.key == BookSort.VALUE
-            ) { vm.toggleSort(BookSort.VALUE) }
+                label = "+ 添加书籍",
+                selected = true
+            ) { addVisible = true }
+            Spacer(Modifier.width(4.dp))
+            // 筛选片恒为选中样式（黑框）：当前筛选态由文字（全部/在书架/不在书架）表达
             EinkChip(
-                label = if (sortState.key == BookSort.PROGRESS) "进度 $arrow" else "进度",
-                selected = sortState.key == BookSort.PROGRESS
-            ) { vm.toggleSort(BookSort.PROGRESS) }
-            EinkChip(
-                label = if (sortState.key == BookSort.PRICE) "定价 $arrow" else "定价",
-                selected = sortState.key == BookSort.PRICE
-            ) { vm.toggleSort(BookSort.PRICE) }
+                label = shelfFilter.label,
+                selected = true
+            ) { vm.cycleFilter() }
         }
         Spacer(Modifier.height(8.dp))
 
@@ -133,7 +153,22 @@ fun BooksScreen(vm: BooksViewModel = hiltViewModel()) {
                 vm.savePrice(book, text, isOfficial)
                 editing = null
             },
-            onResync = { callback -> vm.resyncOfficialPrice(book, callback) }
+            onResync = { callback -> vm.resyncOfficialPrice(book, callback) },
+            isCustom = book.bookId.startsWith(CUSTOM_BOOK_PREFIX),
+            onDelete = {
+                vm.deleteBook(book)
+                editing = null
+            }
+        )
+    }
+
+    if (addVisible) {
+        AddBookDialog(
+            onDismiss = { addVisible = false },
+            onSave = { title, author, priceYuan ->
+                vm.addCustomBook(title, author, priceYuan)
+                addVisible = false
+            }
         )
     }
 }
@@ -167,13 +202,6 @@ private fun BookRow(book: Book, onClick: () -> Unit) {
                             color = GrayDark,
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis
-                        )
-                    }
-                    if (book.removed) {
-                        Text(
-                            "已移出书架（价值仍计入）",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = GrayDark
                         )
                     }
                 }
@@ -224,7 +252,9 @@ private fun PriceEditDialog(
     book: Book,
     onDismiss: () -> Unit,
     onSave: (String, Boolean) -> Unit,
-    onResync: ((ResyncPriceResult) -> Unit) -> Unit
+    onResync: ((ResyncPriceResult) -> Unit) -> Unit,
+    isCustom: Boolean,
+    onDelete: () -> Unit
 ) {
     var text by remember(book.bookId) {
         mutableStateOf(if (book.priceFen > 0) (book.priceFen / 100.0).toString() else "")
@@ -287,6 +317,71 @@ private fun PriceEditDialog(
         }
         Spacer(Modifier.height(4.dp))
         Text("改价需点「保存」后生效；手动价格优先，自动同步不会覆盖", style = MaterialTheme.typography.bodySmall, color = GrayDark)
+        if (isCustom) {
+            Spacer(Modifier.height(10.dp))
+            EinkButton(
+                text = "删除此书",
+                onClick = {
+                    onDelete()
+                    onDismiss()
+                },
+                modifier = Modifier.fillMaxWidth()
+            )
+        }
+    }
+}
+
+/** 手动添加的自定义书籍 bookId 前缀（与 BookRepositoryImpl.addCustomBook 保持一致） */
+private const val CUSTOM_BOOK_PREFIX = "CUSTOM_"
+
+/** 添加自定义书籍：书名必填，作者/定价可选；定价留空为未定价（后续点击补录） */
+@Composable
+private fun AddBookDialog(
+    onDismiss: () -> Unit,
+    onSave: (title: String, author: String, priceYuan: String) -> Unit
+) {
+    var title by remember { mutableStateOf("") }
+    var author by remember { mutableStateOf("") }
+    var price by remember { mutableStateOf("") }
+
+    EinkDialog(
+        onDismissRequest = onDismiss,
+        title = "添加书籍",
+        confirmText = "保存",
+        onConfirm = {
+            if (title.isNotBlank()) onSave(title, author, price)
+        }
+    ) {
+        OutlinedTextField(
+            value = title,
+            onValueChange = { title = it },
+            label = { Text("书名（必填）") },
+            singleLine = true,
+            modifier = Modifier.fillMaxWidth()
+        )
+        Spacer(Modifier.height(8.dp))
+        OutlinedTextField(
+            value = author,
+            onValueChange = { author = it },
+            label = { Text("作者（可选）") },
+            singleLine = true,
+            modifier = Modifier.fillMaxWidth()
+        )
+        Spacer(Modifier.height(8.dp))
+        OutlinedTextField(
+            value = price,
+            onValueChange = { input -> price = input.filter { it.isDigit() || it == '.' } },
+            label = { Text("定价（元，可选）") },
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+            singleLine = true,
+            modifier = Modifier.fillMaxWidth()
+        )
+        Spacer(Modifier.height(4.dp))
+        Text(
+            "自定义书籍按已读完全额计入价值，不会参与微信读书同步",
+            style = MaterialTheme.typography.bodySmall,
+            color = GrayDark
+        )
     }
 }
 

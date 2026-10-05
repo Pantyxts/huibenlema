@@ -44,6 +44,10 @@ interface BookDao {
     @Upsert
     suspend fun upsertAll(books: List<BookEntity>)
 
+    /** 补作者（仅作者为空时写入；书架同步已有作者的书不受影响） */
+    @Query("UPDATE books SET author = :author, updatedAt = :ts WHERE bookId = :bookId AND author = ''")
+    suspend fun updateAuthorIfBlank(bookId: String, author: String, ts: Long)
+
     /** 手动/API 更新定价（MANUAL 优先，API 价不覆盖手动价） */
     @Query(
         "UPDATE books SET priceFen = :priceFen, priceSource = :source, priceUpdatedAt = :ts, updatedAt = :ts " +
@@ -77,6 +81,10 @@ interface BookDao {
     @Query("UPDATE books SET priceFen = 0, priceSource = 'NONE', priceUpdatedAt = 0, updatedAt = :ts " +
         "WHERE priceSource = 'WEREAD' AND priceFen = 0")
     suspend fun resetWereadZeroPrice(ts: Long)
+
+    /** 删除单本（手动添加的自定义书籍） */
+    @Query("DELETE FROM books WHERE bookId = :bookId")
+    suspend fun deleteBook(bookId: String)
 
     /** 清除全部书值数据 */
     @Query("DELETE FROM books")

@@ -29,7 +29,7 @@ class HomeViewModel @Inject constructor(
 ) : ViewModel() {
 
     init {
-        // 启动自动同步：开关开启 + 已登录 + 距上次同步 ≥12 小时 → 自动同步一次。
+        // 启动自动同步：开关开启 + 已登录 + 距上次同步 ≥1 小时 → 自动同步一次。
         // 解决墨水屏系统后台冻结导致周期任务不触发的问题；频繁打开 App 不会重复同步。
         viewModelScope.launch {
             val autoSync = prefs.autoSync.first()
@@ -37,7 +37,27 @@ class HomeViewModel @Inject constructor(
             if (autoSync && hasCredential) {
                 val last = prefs.lastSyncAt.first()
                 if (last <= 0 || System.currentTimeMillis() - last >= AUTO_SYNC_MIN_INTERVAL_MS) {
-                    sync()
+                    // 引导页启动的后台同步仍在进行时不再重复触发（Mutex 会串行，这里直接跳过）
+                    if (!repo.syncing.first()) repo.syncInBackground()
+                }
+            }
+        }
+        // 同步结果统一反馈（手动/自动/后台/周期任务）；页面销毁不取消同步本身
+        viewModelScope.launch {
+            repo.lastSyncResult.collect { r ->
+                _message.value = when (r) {
+                    is SyncResult.Success -> buildString {
+                        append("共导入书籍 ${r.bookCount} 本，获取价格成功 ${r.pricedCount} 本，" +
+                            "获取价格失败 ${r.unpricedCount} 本")
+                        append("\n（自导入书籍无官方价格，显示为 0 元）")
+                        r.priceWarning?.let { append("\n$it") }
+                    }
+                    SyncResult.NoCredential -> "尚未登录，请到「设置 → 登录信息」扫码登录"
+                    SyncResult.AuthFailed -> "凭证已失效，请重新扫码登录"
+                    SyncResult.RateLimited -> "请求过于频繁，请稍后再试"
+                    SyncResult.NetworkError -> "无网络连接，请检查网络后重试"
+                    is SyncResult.Failure -> "同步失败：${r.message}"
+                    is SyncResult.UpgradeRequired -> r.message
                 }
             }
         }
@@ -107,8 +127,9 @@ class HomeViewModel @Inject constructor(
             if (summary != null && seconds > 0) summary.totalValueFen * 3600 / seconds else 0L
         }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), 0L)
 
-    private val _syncing = MutableStateFlow(false)
-    val syncing: StateFlow<Boolean> = _syncing.asStateFlow()
+    /** 同步进行中（全局状态：引导页后台同步、手动同步、自动同步均反映） */
+    val syncing: StateFlow<Boolean> = repo.syncing
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), false)
 
     private val _message = MutableStateFlow<String?>(null)
     val message: StateFlow<String?> = _message.asStateFlow()
@@ -127,25 +148,9 @@ class HomeViewModel @Inject constructor(
         const val AUTO_SYNC_MIN_INTERVAL_MS = 60 * 60 * 1000L
     }
 
+    /** 手动同步：后台执行（app 级 scope），进度与结果经全局流反馈 */
     fun sync() {
-        if (_syncing.value) return
-        viewModelScope.launch {
-            _syncing.value = true
-            _message.value = when (val r = repo.sync()) {
-                is SyncResult.Success -> buildString {
-                    append("共导入书籍 ${r.bookCount} 本，获取价格成功 ${r.pricedCount} 本，" +
-                        "获取价格失败 ${r.unpricedCount} 本")
-                    append("\n（自导入书籍无官方价格，显示为 0 元）")
-                    r.priceWarning?.let { append("\n$it") }
-                }
-                SyncResult.NoCredential -> "尚未登录，请到「设置 → 登录信息」扫码登录"
-                SyncResult.AuthFailed -> "凭证已失效，请重新扫码登录"
-                SyncResult.RateLimited -> "请求过于频繁，请稍后再试"
-                SyncResult.NetworkError -> "无网络连接，请检查网络后重试"
-                is SyncResult.Failure -> "同步失败：${r.message}"
-                is SyncResult.UpgradeRequired -> r.message
-            }
-            _syncing.value = false
-        }
+        if (syncing.value) return
+        repo.syncInBackground()
     }
 }

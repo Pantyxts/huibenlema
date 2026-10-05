@@ -31,6 +31,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -55,6 +56,7 @@ import com.huibenlema.app.ui.components.EinkDialog
 import com.huibenlema.app.ui.components.formatBytes
 import com.huibenlema.app.ui.components.formatFen
 import com.huibenlema.app.ui.components.formatSyncTime
+import com.huibenlema.app.ui.components.SyncProgressBar
 import com.huibenlema.app.ui.login.LoginScreen
 import com.huibenlema.app.ui.theme.GrayDark
 import com.huibenlema.app.ui.theme.GrayLight
@@ -70,10 +72,12 @@ fun SettingsScreen(vm: SettingsViewModel = hiltViewModel()) {
     val lastSyncAt by vm.lastSyncAt.collectAsStateWithLifecycle()
     val autoSync by vm.autoSync.collectAsStateWithLifecycle()
     val syncProgress by vm.syncProgress.collectAsStateWithLifecycle()
+    val syncing by vm.syncing.collectAsStateWithLifecycle()
     val accountName by vm.accountName.collectAsStateWithLifecycle()
     val accountVid by vm.accountVid.collectAsStateWithLifecycle()
     val customCategories by vm.customCategories.collectAsStateWithLifecycle()
     val updateState by vm.updateState.collectAsStateWithLifecycle()
+    var costExpanded by remember { mutableStateOf(false) }
 
     // 进入设置页即清除首页"发现新版本"横幅
     LaunchedEffect(Unit) { vm.clearPendingUpdate() }
@@ -113,7 +117,9 @@ fun SettingsScreen(vm: SettingsViewModel = hiltViewModel()) {
                 if (costItems.isEmpty()) {
                     Text("还没有成本条目", style = MaterialTheme.typography.bodyMedium, color = GrayDark)
                 }
-                costItems.forEach { item ->
+                // 默认最多显示 5 条，超出可展开/收起
+                val visibleItems = if (costExpanded) costItems else costItems.take(MAX_VISIBLE_COSTS)
+                visibleItems.forEach { item ->
                     Row(
                         Modifier
                             .fillMaxWidth()
@@ -131,6 +137,11 @@ fun SettingsScreen(vm: SettingsViewModel = hiltViewModel()) {
                             )
                         }
                         Text(formatFen(item.priceFen), style = MaterialTheme.typography.labelLarge)
+                    }
+                }
+                if (costItems.size > MAX_VISIBLE_COSTS) {
+                    TextButton(onClick = { costExpanded = !costExpanded }) {
+                        Text(if (costExpanded) "收起" else "展开全部 ${costItems.size} 条")
                     }
                 }
                 Row(
@@ -227,13 +238,13 @@ fun SettingsScreen(vm: SettingsViewModel = hiltViewModel()) {
                         }
                     }
                     EinkButton(
-                        text = if (vm.syncing) "同步中…" else "立即同步",
+                        text = if (syncing) "同步中…" else "立即同步",
                         onClick = vm::sync,
-                        enabled = !vm.syncing
+                        enabled = !syncing
                     )
                 }
                 Spacer(Modifier.height(8.dp))
-                if (vm.syncing) {
+                if (syncing) {
                     SyncProgressBar(syncProgress.percent, syncProgress.label)
                 }
                 Spacer(Modifier.height(8.dp))
@@ -258,11 +269,11 @@ fun SettingsScreen(vm: SettingsViewModel = hiltViewModel()) {
             colors = CardDefaults.cardColors(containerColor = Color.White)
         ) {
             Column {
-                TextButton(onClick = vm::openExportConfirm) { Text("导出数据") }
-                TextButton(onClick = {
+                DataActionRow("导出数据", onClick = vm::openExportConfirm)
+                DataActionRow("导入数据", onClick = {
                     importLauncher.launch(arrayOf("application/json"))
-                }) { Text("导入数据") }
-                TextButton(onClick = vm::openClearMenu) { Text("清除数据") }
+                })
+                DataActionRow("清除数据", onClick = vm::openClearMenu)
             }
         }
         Spacer(Modifier.height(16.dp))
@@ -342,7 +353,12 @@ fun SettingsScreen(vm: SettingsViewModel = hiltViewModel()) {
                 onDismissRequest = vm::dismissUpdate,
                 title = "发现新版本 v${st.info.versionName}",
                 confirmText = "下载更新",
-                onConfirm = vm::downloadUpdate
+                onConfirm = vm::downloadUpdate,
+                leftButton = {
+                    TextButton(onClick = vm::ignoreUpdate) {
+                        Text("忽略此版本", color = GrayDark)
+                    }
+                }
             ) {
                 Text(
                     st.info.releaseNotes.ifBlank { "新版本已发布，建议下载更新。" },
@@ -487,7 +503,7 @@ fun SettingsScreen(vm: SettingsViewModel = hiltViewModel()) {
                     ClearMenuItem("清除全部书值数据") { vm.requestClear(SettingsViewModel.ClearAction.ALL_BOOKS) }
                     ClearMenuItem("清除非手动书值数据") { vm.requestClear(SettingsViewModel.ClearAction.NON_MANUAL) }
                     ClearMenuItem("清除手动书值数据") { vm.requestClear(SettingsViewModel.ClearAction.MANUAL) }
-                    ClearMenuItem("清除所有成本栏目") { vm.requestClear(SettingsViewModel.ClearAction.COSTS) }
+                    ClearMenuItem("清除所有成本条目") { vm.requestClear(SettingsViewModel.ClearAction.COSTS) }
                     ClearMenuItem("清除应用全部数据") { vm.requestClear(SettingsViewModel.ClearAction.EVERYTHING) }
                     Spacer(Modifier.height(8.dp))
                     TextButton(
@@ -529,6 +545,23 @@ private fun SectionTitle(text: String) {
     Spacer(Modifier.height(6.dp))
 }
 
+/** 成本一览默认最多显示的条目数 */
+private const val MAX_VISIBLE_COSTS = 5
+
+/** 数据区操作行：整行可点击（不限于文字区域），无涟漪 */
+@Composable
+private fun DataActionRow(label: String, onClick: () -> Unit) {
+    val interactionSource = remember { MutableInteractionSource() }
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .clickable(interactionSource = interactionSource, indication = null, onClick = onClick)
+            .padding(horizontal = 12.dp, vertical = 14.dp)
+    ) {
+        Text(label, style = MaterialTheme.typography.bodyMedium)
+    }
+}
+
 /** 清除选项菜单项 */
 @Composable
 private fun ClearMenuItem(label: String, onClick: () -> Unit) {
@@ -557,36 +590,6 @@ private fun EinkSwitch(checked: Boolean, onToggle: () -> Unit) {
                 .size(16.dp)
                 .background(if (checked) Color.White else InkBlack, RoundedCornerShape(8.dp))
         )
-    }
-}
-
-/** 同步进度条：百分比 + 阶段说明 + 细进度条 */
-@Composable
-private fun SyncProgressBar(percent: Int, label: String) {
-    Column(Modifier.fillMaxWidth()) {
-        Row {
-            Text(
-                "$percent%",
-                style = MaterialTheme.typography.bodySmall,
-                fontWeight = FontWeight.Bold
-            )
-            Spacer(Modifier.width(8.dp))
-            Text(label, style = MaterialTheme.typography.bodySmall)
-        }
-        Spacer(Modifier.height(4.dp))
-        Box(
-            Modifier
-                .fillMaxWidth()
-                .height(8.dp)
-                .background(GrayLight)
-        ) {
-            Box(
-                Modifier
-                    .fillMaxWidth(fraction = percent / 100f)
-                    .fillMaxHeight()
-                    .background(InkBlack)
-            )
-        }
     }
 }
 

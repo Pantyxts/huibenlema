@@ -37,6 +37,7 @@ class UserPrefs @Inject constructor(@ApplicationContext private val context: Con
         val COST_CATEGORIES = stringSetPreferencesKey("cost_categories")
         val LAST_UPDATE_CHECK_AT = longPreferencesKey("last_update_check_at")
         val PENDING_UPDATE_VERSION = stringPreferencesKey("pending_update_version")
+        val IGNORED_UPDATE_VERSION = stringPreferencesKey("ignored_update_version")
     }
 
     val apiKeyCipher: Flow<String?> = context.dataStore.data.map { it[Keys.API_KEY_CIPHER] }
@@ -53,6 +54,7 @@ class UserPrefs @Inject constructor(@ApplicationContext private val context: Con
         context.dataStore.data.map { it[Keys.COST_CATEGORIES] ?: emptySet() }
     val lastUpdateCheckAt: Flow<Long> = context.dataStore.data.map { it[Keys.LAST_UPDATE_CHECK_AT] ?: 0L }
     val pendingUpdateVersion: Flow<String?> = context.dataStore.data.map { it[Keys.PENDING_UPDATE_VERSION] }
+    val ignoredUpdateVersion: Flow<String?> = context.dataStore.data.map { it[Keys.IGNORED_UPDATE_VERSION] }
 
     suspend fun setApiKeyCipher(value: String?) {
         context.dataStore.edit { p ->
@@ -124,5 +126,10 @@ class UserPrefs @Inject constructor(@ApplicationContext private val context: Con
         context.dataStore.edit { p ->
             if (value == null) p.remove(Keys.PENDING_UPDATE_VERSION) else p[Keys.PENDING_UPDATE_VERSION] = value
         }
+    }
+
+    /** 用户选择忽略的更新版本：该版本不再通知，更高版本正常通知 */
+    suspend fun setIgnoredUpdateVersion(value: String) {
+        context.dataStore.edit { it[Keys.IGNORED_UPDATE_VERSION] = value }
     }
 }

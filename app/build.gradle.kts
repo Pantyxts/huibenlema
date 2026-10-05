@@ -36,7 +36,8 @@ android {
             // 兼容旧墨水屏（targetSdk<=28 + 32 位 ABI）；掌阅 Neo3 Ultra（安卓14）跑 arm64 切片
             targetSdk = 28
             // ⚠️ 每次发版必须递增！Android 按 versionCode 判断"已安装该版本"
-            versionCode = 101013
+            // （beta 迭代同样递增：SmartOS 对相同 versionCode 的覆盖安装会拒绝）
+            versionCode = 101019
             ndk {
                 abiFilters += listOf("arm64-v8a", "armeabi-v7a")
             }

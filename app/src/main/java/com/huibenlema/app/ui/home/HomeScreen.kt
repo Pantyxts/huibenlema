@@ -38,6 +38,7 @@ import com.huibenlema.app.ui.components.EinkChip
 import com.huibenlema.app.ui.components.EinkPieChart
 import com.huibenlema.app.ui.components.PaybackBar
 import com.huibenlema.app.ui.components.PieLegend
+import com.huibenlema.app.ui.components.SyncProgressBar
 import com.huibenlema.app.ui.components.formatCnDate
 import com.huibenlema.app.ui.components.formatFen
 import com.huibenlema.app.ui.components.formatReadSeconds
@@ -249,36 +250,6 @@ fun HomeScreen(
             )
         }
         Spacer(Modifier.height(24.dp))
-    }
-}
-
-/** 同步进度条：百分比 + 阶段说明 + 细进度条（与设置页同款） */
-@Composable
-private fun SyncProgressBar(percent: Int, label: String) {
-    Column(Modifier.fillMaxWidth()) {
-        Row {
-            Text(
-                "$percent%",
-                style = MaterialTheme.typography.bodySmall,
-                fontWeight = FontWeight.Bold
-            )
-            Spacer(Modifier.width(8.dp))
-            Text(label, style = MaterialTheme.typography.bodySmall)
-        }
-        Spacer(Modifier.height(4.dp))
-        Box(
-            Modifier
-                .fillMaxWidth()
-                .height(8.dp)
-                .background(GrayLight)
-        ) {
-            Box(
-                Modifier
-                    .fillMaxWidth(fraction = percent / 100f)
-                    .fillMaxHeight()
-                    .background(InkBlack)
-            )
-        }
     }
 }
 

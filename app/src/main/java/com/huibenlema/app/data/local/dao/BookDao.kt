@@ -17,6 +17,16 @@ interface BookDao {
     @Query("SELECT * FROM books WHERE onShelf = 1 AND removed = 0")
     suspend fun getShelfBooksOnce(): List<BookEntity>
 
+    /** 读过的书：书架 + 已移出书架但有进度记录的书（价值统计口径） */
+    @Query(
+        "SELECT * FROM books WHERE (onShelf = 1 AND removed = 0) OR (removed = 1 AND progress > 0) " +
+            "ORDER BY progress * priceFen DESC"
+    )
+    fun observeReadBooks(): Flow<List<BookEntity>>
+
+    @Query("SELECT * FROM books WHERE (onShelf = 1 AND removed = 0) OR (removed = 1 AND progress > 0)")
+    suspend fun getReadBooksOnce(): List<BookEntity>
+
     @Query("SELECT * FROM books WHERE bookId = :bookId")
     suspend fun getById(bookId: String): BookEntity?
 

@@ -14,6 +14,7 @@ import com.huibenlema.app.data.local.entity.PriceCacheEntity
 import com.huibenlema.app.data.local.entity.ReadHistoryEntity
 import com.huibenlema.app.data.local.entity.SyncLogEntity
 import com.huibenlema.app.data.remote.GatewayResult
+import com.huibenlema.app.data.remote.LongestBookDto
 import com.huibenlema.app.data.remote.OfficialGatewayClient
 import com.huibenlema.app.data.remote.PrivateWereadApi
 import com.huibenlema.app.data.remote.lng
@@ -224,9 +225,13 @@ class SyncManager @Inject constructor(
             )
         }
 
-        // 6. readdata 回溯（提供按日权重）
-        backfillReadSeconds(key, today)
-        tracker.update(92, "统计回溯完成")
+        // 6. readdata 回溯（提供按日权重；顺带收集时长榜书单）
+        val longestBooks = backfillReadSeconds(key, today)
+        tracker.update(90, "统计回溯完成")
+
+        // 6.5 补捞读完移出书架的书（readLongest 与书架状态无关）
+        fetchLongestBooks(key, cookie, longestBooks, now)
+        tracker.update(92, "补捞完成")
 
         // 7. 本地重建每日价值（含逐书明细；幂等，定价变化与历史数据都能正确反映）
         rebuildDailyValues(today)
@@ -320,9 +325,11 @@ class SyncManager @Inject constructor(
      * readdata 历史回溯：本月总是刷新；历史月份有数据则跳过。
      * 最多回溯 12 个月；连续空月提前终止。
      */
-    private suspend fun backfillReadSeconds(key: String, today: LocalDate) {
+    /** @return readLongest 时长榜书单（去重，供补捞读完移出书架的书） */
+    private suspend fun backfillReadSeconds(key: String, today: LocalDate): List<LongestBookDto> {
         val zone = ZoneId.systemDefault()
         val currentMonth = today.withDayOfMonth(1)
+        val longest = mutableMapOf<String, LongestBookDto>()
         for (offset in 0..BACKFILL_MONTHS) {
             val monthStart = currentMonth.minusMonths(offset.toLong())
             val prefix = monthStart.toString().take(7)
@@ -339,6 +346,7 @@ class SyncManager @Inject constructor(
             if (r.data.registTime > 0 && prefs.registTime.first() == 0L) {
                 prefs.setRegistTime(r.data.registTime)
             }
+            r.data.longestBooks.forEach { longest.putIfAbsent(it.bookId, it) }
             r.data.dailySeconds.forEach { (date, seconds) ->
                 if (seconds <= 0) return@forEach
                 val cur = dailyStatDao.get(date)
@@ -350,6 +358,57 @@ class SyncManager @Inject constructor(
                         bookCount = cur?.bookCount ?: 0
                     )
                 )
+            }
+        }
+        return longest.values.toList()
+    }
+
+    /**
+     * 补捞时长榜书单：不在本地 books 表的书（读完即移出书架、从未在书架同步过）
+     * 补建记录 + 补进度（官方 getprogress 按 bookId 查询，不限书架）+ 补价。
+     * 补建后 removed=1 且 progress>0，进入价值统计口径（observeReadBooks）。
+     */
+    private suspend fun fetchLongestBooks(
+        key: String,
+        cookie: String?,
+        longest: List<LongestBookDto>,
+        now: Long
+    ) {
+        for (lb in longest) {
+            if (bookDao.getById(lb.bookId) != null) continue
+            bookDao.upsertAll(
+                listOf(
+                    BookEntity(
+                        bookId = lb.bookId,
+                        title = lb.title.ifBlank { "未知书名" },
+                        onShelf = false,
+                        removed = true,
+                        createdAt = now,
+                        updatedAt = now
+                    )
+                )
+            )
+            when (val p = client.getProgress(key, lb.bookId)) {
+                is GatewayResult.Ok -> {
+                    bookDao.updateProgress(
+                        bookId = lb.bookId,
+                        progress = p.data.progressRatio,
+                        finished = p.data.finished,
+                        totalReadSeconds = p.data.recordReadingTime,
+                        lastReadAt = p.data.updateTime,
+                        ts = now,
+                        fetchedAt = now
+                    )
+                }
+                is GatewayResult.Err -> { /* 单本失败不影响其他 */ }
+                is GatewayResult.UpgradeRequired -> return
+            }
+            if (!cookie.isNullOrBlank()) {
+                val fen = fetchPriceFenViaPrivate(lb.bookId, cookie)
+                if (fen != null) {
+                    bookDao.updatePrice(lb.bookId, fen, PriceSource.WEREAD, now)
+                    cachePrice(lb.bookId, fen, now)
+                }
             }
         }
     }

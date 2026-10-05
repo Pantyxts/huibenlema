@@ -29,7 +29,7 @@ class BooksViewModel @Inject constructor(
     private val sort = MutableStateFlow(SortState(BookSort.VALUE, ascending = false))
 
     val books: StateFlow<List<Book>> =
-        combine(repo.observeShelfBooks(), sort) { list, s ->
+        combine(repo.observeReadBooks(), sort) { list, s ->
             val sorted = when (s.key) {
                 BookSort.VALUE -> list.sortedBy { it.contributedFen }
                 BookSort.PROGRESS -> list.sortedBy { it.progress }

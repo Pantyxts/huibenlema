@@ -80,8 +80,8 @@ class HomeViewModel @Inject constructor(
         if (rest > 0) top + PieSlice("其他成本", rest) else top
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
 
-    /** 书值占比饼图（最多 5 块：Top4 + 其他书籍聚合） */
-    val bookSlices: StateFlow<List<PieSlice>> = repo.observeShelfBooks().map { books ->
+    /** 书值占比饼图（最多 5 块：Top4 + 其他书籍聚合；含已移出书架的书） */
+    val bookSlices: StateFlow<List<PieSlice>> = repo.observeReadBooks().map { books ->
         val sorted = books.filter { it.contributedFen > 0 }
             .sortedByDescending { it.contributedFen }
         val top = sorted.take(4).map { PieSlice(it.title, it.contributedFen) }

@@ -67,8 +67,12 @@ class BookRepositoryImpl @Inject constructor(
     override fun observeShelfBooks(): Flow<List<Book>> =
         bookDao.observeShelfBooks().map { list -> list.map { it.toDomain() } }
 
+    override fun observeReadBooks(): Flow<List<Book>> =
+        bookDao.observeReadBooks().map { list -> list.map { it.toDomain() } }
+
+    /** 回本总价值：读过的书（含已移出书架的） */
     override fun observeSummary(): Flow<PaybackSummary> =
-        combine(bookDao.observeShelfBooks(), costItemDao.observeAll()) { books, costs ->
+        combine(bookDao.observeReadBooks(), costItemDao.observeAll()) { books, costs ->
             PaybackCalculator.compute(
                 books = books.map { it.toDomain() },
                 costs = costs.map { it.toDomain() }

@@ -51,6 +51,9 @@ interface BookRepository {
 
     fun observeShelfBooks(): Flow<List<Book>>
 
+    /** 读过的书（价值统计口径）：书架 + 已移出书架但有进度记录的书 */
+    fun observeReadBooks(): Flow<List<Book>>
+
     fun observeSummary(): Flow<PaybackSummary>
 
     /** 近 days 天每日价值（含今天，无数据的日期由 UI 补零） */

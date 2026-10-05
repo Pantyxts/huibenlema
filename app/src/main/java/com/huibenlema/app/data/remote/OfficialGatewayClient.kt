@@ -104,11 +104,18 @@ class OfficialGatewayClient @Inject constructor(
                     val date = Instant.ofEpochSecond(ts).atZone(zone).toLocalDate().toString()
                     date to ((v as? JsonPrimitive)?.longOrNull ?: 0L)
                 }?.toMap() ?: emptyMap()
+                // readLongest：累计时长榜（含已移出书架的书）
+                val longest = (r.data["readLongest"] as? JsonArray)?.mapNotNull { el ->
+                    val b = (el as? JsonObject)?.get("book") as? JsonObject ?: return@mapNotNull null
+                    val id = b.str("bookId").takeIf { it.isNotBlank() } ?: return@mapNotNull null
+                    LongestBookDto(bookId = id, title = b.str("title"))
+                } ?: emptyList()
                 GatewayResult.Ok(
                     ReadDataDto(
                         totalReadTime = r.data.lng("totalReadTime"),
                         dailySeconds = daily,
-                        registTime = r.data.lng("registTime")
+                        registTime = r.data.lng("registTime"),
+                        longestBooks = longest
                     )
                 )
             }

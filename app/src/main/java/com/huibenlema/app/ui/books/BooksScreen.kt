@@ -169,6 +169,13 @@ private fun BookRow(book: Book, onClick: () -> Unit) {
                             overflow = TextOverflow.Ellipsis
                         )
                     }
+                    if (book.removed) {
+                        Text(
+                            "已移出书架（价值仍计入）",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = GrayDark
+                        )
+                    }
                 }
                 // 贡献价值大字优先；无价书显示 ¥0
                 Text(

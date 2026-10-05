@@ -54,5 +54,10 @@ data class ReadDataDto(
     /** date(yyyy-MM-dd) -> 当日阅读秒数（readTimes 按天分桶） */
     val dailySeconds: Map<String, Long>,
     /** 账号注册时间（Unix 秒，官方接口唯一的账号特性字段） */
-    val registTime: Long = 0L
+    val registTime: Long = 0L,
+    /** 累计时长榜书单（与书架状态无关，用于补捞读完移出书架的书） */
+    val longestBooks: List<LongestBookDto> = emptyList()
 )
+
+/** readLongest 榜单条目 */
+data class LongestBookDto(val bookId: String, val title: String)

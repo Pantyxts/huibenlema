@@ -23,7 +23,9 @@ data class Book(
     /** 累计阅读时长（秒） */
     val totalReadSeconds: Long = 0L,
     val lastReadAt: Long = 0L,
-    val onShelf: Boolean = true
+    val onShelf: Boolean = true,
+    /** 已移出书架（读完移除/下架）；有进度的移出书仍计入价值 */
+    val removed: Boolean = false
 ) {
     /** 本书贡献价值（分）= 进度 × 定价 */
     val contributedFen: Long

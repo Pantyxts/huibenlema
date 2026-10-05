@@ -3,6 +3,8 @@
 纯本地、隐私优先的 Android 应用：拉取微信读书的书架与阅读进度，按书籍定价折算「已读总价值」，
 对照你的阅读设备 + 会员等成本台账，计算回本进度与每日阅读价值。
 
+小红书链接：https://www.xiaohongshu.com/discovery/item/6ac2ab0a000000001802b01f?source=webshare&xhsshare=pc_web&xsec_token=ABdgskZzYDbqA2yzfcWbT07_BjYwE9g3WKNNmw5ZEmIzQ=&xsec_source=pc_share
+
 - 应用名：回本了吗
 - 包名：`com.huibenlema.app`
 - 构建变体：`eink`（墨水屏版，先行）/ `universal`（通用手机版，阶段 3）

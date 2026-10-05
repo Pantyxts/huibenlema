@@ -2,6 +2,9 @@ package com.huibenlema.app.data.update
 
 import android.content.Context
 import android.content.Intent
+import android.net.Uri
+import android.os.Build
+import android.provider.Settings
 import androidx.core.content.FileProvider
 import com.huibenlema.app.BuildConfig
 import com.huibenlema.app.data.local.UserPrefs
@@ -56,6 +59,8 @@ class UpdateManager @Inject constructor(
             val speedBytesPerSec: Long
         ) : UpdateState()
         data class Downloaded(val file: File) : UpdateState()
+        /** 已下载但未获得「安装未知应用」权限，需引导用户去系统设置开启 */
+        data class NeedInstallPermission(val file: File) : UpdateState()
         data class Failed(val message: String) : UpdateState()
     }
 
@@ -176,19 +181,66 @@ class UpdateManager @Inject constructor(
         null
     }
 
-    /** 拉起系统安装器（需要用户已允许"安装未知应用"） */
+    /**
+     * 拉起系统安装器。
+     * Android 8.0+ 需要「安装未知应用」权限：未授权时系统不提供可处理安装 Intent 的组件
+     * （定制系统上表现为 No Activity found），先进入授权引导状态。
+     * 已授权后多级兜底：不同 ROM 注册的安装器入口不同（VIEW+MIME / VIEW / INSTALL_PACKAGE）。
+     */
     fun install(file: File) {
-        try {
-            val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
-            val intent = Intent(Intent.ACTION_VIEW).apply {
+        if (!canInstallPackages()) {
+            _state.value = UpdateState.NeedInstallPermission(file)
+            return
+        }
+        val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
+        // 1) content:// + APK MIME（标准方式，主流设备）
+        // 2) content:// 不带 MIME（个别设备只认纯 URI）
+        // 3) ACTION_INSTALL_PACKAGE（AOSP 安装器同时注册该入口，部分定制系统只留这一个）
+        val candidates = listOf(
+            Intent(Intent.ACTION_VIEW).apply {
                 setDataAndType(uri, "application/vnd.android-package-archive")
                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            },
+            Intent(Intent.ACTION_VIEW).apply {
+                data = uri
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            },
+            Intent(Intent.ACTION_INSTALL_PACKAGE).apply {
+                data = uri
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_GRANT_READ_URI_PERMISSION)
             }
-            context.startActivity(intent)
-        } catch (e: Exception) {
-            _state.value = UpdateState.Failed("无法打开安装器：${e.message}")
+        )
+        for (intent in candidates) {
+            // 每条路径独立容错：个别 ROM resolveActivity 能查到组件但实际拉起失败
+            val launched = runCatching {
+                if (!canHandle(intent)) return@runCatching false
+                context.startActivity(intent)
+                true
+            }.getOrDefault(false)
+            if (launched) return
         }
+        _state.value = UpdateState.Failed("系统安装器不可用，请检查设备是否禁用了应用安装功能")
     }
+
+    /** 是否已获得「安装未知应用」权限（Android 8.0 以下无此限制） */
+    fun canInstallPackages(): Boolean =
+        Build.VERSION.SDK_INT < Build.VERSION_CODES.O || context.packageManager.canRequestPackageInstalls()
+
+    /** 跳转系统设置开启「安装未知应用」；个别 ROM 无该页面时兜底跳应用详情页 */
+    fun openInstallPermissionSettings() {
+        val target = Intent(
+            Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
+            Uri.parse("package:${context.packageName}")
+        ).let { settings ->
+            if (canHandle(settings)) settings
+            else Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:${context.packageName}"))
+        }
+        runCatching { context.startActivity(target.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)) }
+    }
+
+    /** 系统是否有能处理该 Intent 的组件（避免 startActivity 抛 ActivityNotFoundException） */
+    private fun canHandle(intent: Intent): Boolean =
+        context.packageManager.resolveActivity(intent, android.content.pm.PackageManager.MATCH_DEFAULT_ONLY) != null
 
     fun reset() {
         _state.value = UpdateState.Idle

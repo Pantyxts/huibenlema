@@ -74,9 +74,22 @@ class SettingsViewModel @Inject constructor(
     }
 
     fun installUpdate() {
-        val st = updateState.value as? UpdateManager.UpdateState.Downloaded ?: return
-        updateManager.install(st.file)
+        val st = updateState.value
+        val file = when (st) {
+            is UpdateManager.UpdateState.Downloaded -> st.file
+            is UpdateManager.UpdateState.NeedInstallPermission -> st.file
+            else -> return
+        }
+        updateManager.install(file)
     }
+
+    /** 跳转系统设置开启「安装未知应用」权限 */
+    fun openInstallPermissionSettings() {
+        updateManager.openInstallPermissionSettings()
+    }
+
+    /** 是否已获得「安装未知应用」权限（从系统设置返回后自动重试安装用） */
+    fun canInstallPackages(): Boolean = updateManager.canInstallPackages()
 
     fun dismissUpdate() {
         updateManager.reset()

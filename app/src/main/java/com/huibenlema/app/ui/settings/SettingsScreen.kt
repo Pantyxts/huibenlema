@@ -14,6 +14,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -40,10 +41,10 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
-import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
 import androidx.hilt.navigation.compose.hiltViewModel
+import androidx.lifecycle.compose.LifecycleResumeEffect
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.huibenlema.app.BuildConfig
 import com.huibenlema.app.data.update.UpdateManager
@@ -81,6 +82,15 @@ fun SettingsScreen(vm: SettingsViewModel = hiltViewModel()) {
 
     // 进入设置页即清除首页"发现新版本"横幅
     LaunchedEffect(Unit) { vm.clearPendingUpdate() }
+
+    // 从系统设置授予「安装未知应用」权限返回后，自动继续安装
+    LifecycleResumeEffect(Unit) {
+        val st = vm.updateState.value
+        if (st is UpdateManager.UpdateState.NeedInstallPermission && vm.canInstallPackages()) {
+            vm.installUpdate()
+        }
+        onPauseOrDispose { }
+    }
 
     // 数据导出：系统文件选择器（SAF），零存储权限
     val exportLauncher = rememberLauncherForActivityResult(
@@ -363,8 +373,9 @@ fun SettingsScreen(vm: SettingsViewModel = hiltViewModel()) {
                 Text(
                     st.info.releaseNotes.ifBlank { "新版本已发布，建议下载更新。" },
                     style = MaterialTheme.typography.bodySmall,
-                    maxLines = 8,
-                    overflow = TextOverflow.Ellipsis
+                    modifier = Modifier
+                        .heightIn(max = 260.dp)
+                        .verticalScroll(rememberScrollState())
                 )
             }
         }
@@ -456,6 +467,25 @@ fun SettingsScreen(vm: SettingsViewModel = hiltViewModel()) {
                 onConfirm = vm::installUpdate
             ) {
                 Text("新版本已下载完成，安装完成后即可使用。")
+            }
+        }
+        is UpdateManager.UpdateState.NeedInstallPermission -> {
+            EinkDialog(
+                onDismissRequest = vm::dismissUpdate,
+                title = "需要开启「安装未知应用」",
+                confirmText = "重新安装",
+                onConfirm = vm::installUpdate,
+                leftButton = {
+                    TextButton(onClick = vm::openInstallPermissionSettings) {
+                        Text("去开启", color = GrayDark)
+                    }
+                }
+            ) {
+                Text(
+                    "系统未允许本应用安装更新。\n" +
+                        "请点击「去开启」，在系统设置中打开「允许安装未知应用」，返回后点击「重新安装」。",
+                    style = MaterialTheme.typography.bodySmall
+                )
             }
         }
         is UpdateManager.UpdateState.Failed -> {

@@ -13,6 +13,8 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -25,20 +27,26 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.compose.foundation.layout.heightIn
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.huibenlema.app.data.local.UserPrefs
+import com.huibenlema.app.data.log.AppLog
 import com.huibenlema.app.ui.books.BooksScreen
+import com.huibenlema.app.ui.components.EinkDialog
 import com.huibenlema.app.ui.home.HomeScreen
 import com.huibenlema.app.ui.onboarding.OnboardingScreen
 import com.huibenlema.app.ui.settings.SettingsScreen
+import com.huibenlema.app.ui.theme.GrayDark
 import com.huibenlema.app.ui.theme.InkBlack
 import dagger.hilt.android.lifecycle.HiltViewModel
 import javax.inject.Inject
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
-import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.stateIn
 
 /** 应用内页面（简单状态导航，墨水屏零动画） */
@@ -54,13 +62,40 @@ class RootViewModel @Inject constructor(prefs: UserPrefs) : ViewModel() {
     val onboardingDone = prefs.onboardingDone
         .stateIn(viewModelScope, SharingStarted.Eagerly, false)
 
-    val hasCredential = prefs.apiKeyCipher.map { !it.isNullOrBlank() }
-        .stateIn(viewModelScope, SharingStarted.Eagerly, false)
+    /** 上次崩溃的栈信息（重启后弹窗显示，用户可查看/拍照回传定位） */
+    private val _lastCrash = MutableStateFlow(AppLog.readLastCrash())
+    val lastCrash: StateFlow<String?> = _lastCrash.asStateFlow()
+
+    fun dismissCrash() {
+        _lastCrash.value = null
+        AppLog.clearLastCrash()
+    }
 }
 
 @Composable
 fun AppRoot(vm: RootViewModel = hiltViewModel()) {
     val onboardingDone by vm.onboardingDone.collectAsStateWithLifecycle()
+
+    // 崩溃信息弹窗：上次运行崩溃后重启自动弹出，用户可查看栈内容（排查用）
+    val lastCrash by vm.lastCrash.collectAsStateWithLifecycle()
+    lastCrash?.let { crash ->
+        EinkDialog(
+            onDismissRequest = vm::dismissCrash,
+            title = "上次运行时发生错误",
+            confirmText = "知道了",
+            onConfirm = vm::dismissCrash
+        ) {
+            Text(
+                "请记录以下信息并反馈给开发者：\n\n$crash",
+                style = MaterialTheme.typography.bodySmall,
+                color = GrayDark,
+                modifier = Modifier
+                    .heightIn(max = 260.dp)
+                    .verticalScroll(rememberScrollState())
+            )
+        }
+    }
+
     if (!onboardingDone) {
         OnboardingScreen()
         return

@@ -1,5 +1,6 @@
 package com.huibenlema.app.data.remote
 
+import com.huibenlema.app.data.log.AppLog
 import java.io.IOException
 import java.time.Instant
 import java.time.ZoneId
@@ -115,10 +116,39 @@ class OfficialGatewayClient @Inject constructor(
     }
 
     /** 阅读统计（monthly）：readTimes 按天分桶 → 每日阅读秒数 */
-    suspend fun readMonthly(key: String, baseTime: Long = 0L): GatewayResult<ReadDataDto> {
+    suspend fun readMonthly(key: String, baseTime: Long = 0L): GatewayResult<ReadDataDto> =
+        readData(key, "monthly", baseTime)
+
+    /**
+     * 阅读统计（annually）：readTimes 按月分桶；dailyReadTimes（按天分桶）存在时优先使用——
+     * 年粒度一次请求拿全年日级时长，替代逐月回溯（提速约 12 倍）；
+     * dailyReadTimes 缺失时 dailySeconds 为空，调用方回退逐月拉取。
+     */
+    suspend fun readAnnually(key: String, baseTime: Long = 0L): GatewayResult<ReadDataDto> {
         return when (val r = call(
             key, "/readdata/detail",
-            mapOf("mode" to JsonPrimitive("monthly"), "baseTime" to JsonPrimitive(baseTime))
+            mapOf("mode" to JsonPrimitive("annually"), "baseTime" to JsonPrimitive(baseTime))
+        )) {
+            is GatewayResult.Ok -> {
+                val zone = ZoneId.systemDefault()
+                // 年粒度优先用 dailyReadTimes（按天）；缺失时 dailySeconds 为空，
+                // 调用方（同步回溯）自动回退逐月拉取
+                val daily = (r.data["dailyReadTimes"] as? JsonObject)?.entries?.mapNotNull { (k, v) ->
+                    val ts = k.toLongOrNull() ?: return@mapNotNull null
+                    val date = Instant.ofEpochSecond(ts).atZone(zone).toLocalDate().toString()
+                    date to ((v as? JsonPrimitive)?.longOrNull ?: 0L)
+                }?.toMap() ?: emptyMap()
+                GatewayResult.Ok(parseReadData(r.data, daily, parseLongest(r.data)))
+            }
+            is GatewayResult.Err -> r
+            is GatewayResult.UpgradeRequired -> r
+        }
+    }
+
+    private suspend fun readData(key: String, mode: String, baseTime: Long): GatewayResult<ReadDataDto> {
+        return when (val r = call(
+            key, "/readdata/detail",
+            mapOf("mode" to JsonPrimitive(mode), "baseTime" to JsonPrimitive(baseTime))
         )) {
             is GatewayResult.Ok -> {
                 val readTimes = r.data["readTimes"] as? JsonObject
@@ -128,18 +158,51 @@ class OfficialGatewayClient @Inject constructor(
                     val date = Instant.ofEpochSecond(ts).atZone(zone).toLocalDate().toString()
                     date to ((v as? JsonPrimitive)?.longOrNull ?: 0L)
                 }?.toMap() ?: emptyMap()
-                // readLongest：累计时长榜（含已移出书架的书）
-                val longest = (r.data["readLongest"] as? JsonArray)?.mapNotNull { el ->
-                    val b = (el as? JsonObject)?.get("book") as? JsonObject ?: return@mapNotNull null
-                    val id = b.str("bookId").takeIf { it.isNotBlank() } ?: return@mapNotNull null
-                    LongestBookDto(bookId = id, title = b.str("title"))
-                } ?: emptyList()
+                GatewayResult.Ok(parseReadData(r.data, daily, parseLongest(r.data)))
+            }
+            is GatewayResult.Err -> r
+            is GatewayResult.UpgradeRequired -> r
+        }
+    }
+
+    /** readLongest 榜单解析（月/年通用）：readTime = 该周期单书阅读秒数 */
+    private fun parseLongest(data: JsonObject): List<LongestBookDto> =
+        (data["readLongest"] as? JsonArray)?.mapNotNull { el ->
+            val o = el as? JsonObject ?: return@mapNotNull null
+            val b = o.get("book") as? JsonObject ?: return@mapNotNull null
+            val id = b.str("bookId").takeIf { it.isNotBlank() } ?: return@mapNotNull null
+            LongestBookDto(
+                bookId = id,
+                title = b.str("title"),
+                readTime = o.lng("readTime")
+            )
+        } ?: emptyList()
+
+    private fun parseReadData(
+        data: JsonObject,
+        dailySeconds: Map<String, Long>,
+        longestBooks: List<LongestBookDto>
+    ): ReadDataDto = ReadDataDto(
+        totalReadTime = data.lng("totalReadTime"),
+        dailySeconds = dailySeconds,
+        registTime = data.lng("registTime"),
+        longestBooks = longestBooks
+    )
+
+    /** 书籍基本信息（官方通道，无价格）：补作者/元数据替代私有通道 */
+    suspend fun bookInfo(key: String, bookId: String): GatewayResult<BookInfoDto> {
+        return when (val r = call(key, "/book/info", mapOf("bookId" to JsonPrimitive(bookId)))) {
+            is GatewayResult.Ok -> {
+                val b = r.data["book"] as? JsonObject ?: r.data
                 GatewayResult.Ok(
-                    ReadDataDto(
-                        totalReadTime = r.data.lng("totalReadTime"),
-                        dailySeconds = daily,
-                        registTime = r.data.lng("registTime"),
-                        longestBooks = longest
+                    BookInfoDto(
+                        bookId = b.str("bookId").ifBlank { bookId },
+                        author = b.str("author"),
+                        translator = b.str("translator"),
+                        publisher = b.str("publisher"),
+                        isbn = b.str("isbn"),
+                        cover = b.str("cover"),
+                        category = b.str("category")
                     )
                 )
             }
@@ -162,6 +225,8 @@ class OfficialGatewayClient @Inject constructor(
             val resp = api.call("Bearer $key", body)
             val upgrade = resp["upgrade_info"] as? JsonObject
             if (upgrade != null) {
+                // 记录完整升级信息（官方新 skill 版本号/下载地址），供排障与更新 SKILL_VERSION
+                AppLog.i("HBWeb", "upgrade_info=$upgrade")
                 return GatewayResult.UpgradeRequired(upgrade.str("message").ifBlank { "微信读书 Skill 版本已升级" })
             }
             val errcode = resp.lng("errcode")
@@ -185,7 +250,7 @@ class OfficialGatewayClient @Inject constructor(
 
     companion object {
         /** 官方 Skill 包版本（v1.0.4）；请求必带 */
-        const val SKILL_VERSION = "1.0.4"
+        const val SKILL_VERSION = "1.0.5"
 
         /** notebooks 分页翻页上限（每页 100 本，防游标异常死循环） */
         private const val MAX_NOTEBOOK_PAGES = 50

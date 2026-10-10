@@ -5,6 +5,7 @@ import kotlinx.serialization.Serializable
 /**
  * 数据导出/备份文件结构（formatVersion 1）。
  * 凭证（API Key / Cookie）一律不导出；金额一律分。
+ * 备份只含书籍与成本台账；每日价值由同步重建生成，不随备份走。
  */
 @Serializable
 data class BackupFile(
@@ -12,7 +13,8 @@ data class BackupFile(
     val exportedAt: Long,
     val books: List<BackupBook>,
     val costs: List<BackupCost>,
-    val dailyStats: List<BackupDailyStat>
+    /** 旧版备份携带的每日统计：仅兼容解析旧文件，导入时一律忽略 */
+    val dailyStats: List<BackupDailyStat> = emptyList()
 )
 
 @Serializable

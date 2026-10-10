@@ -75,6 +75,12 @@ fun OnboardingScreen(vm: OnboardingViewModel = hiltViewModel()) {
             enabled = !vm.working,
             modifier = Modifier.fillMaxWidth()
         )
+        Spacer(Modifier.height(6.dp))
+        Text(
+            "将开启每天自动同步（可在「设置」中关闭）",
+            style = MaterialTheme.typography.bodySmall,
+            color = GrayDark
+        )
         Spacer(Modifier.height(4.dp))
         TextButton(
             onClick = vm::skip,

@@ -1,5 +1,6 @@
 package com.huibenlema.app.ui.settings
 
+import android.content.Context
 import android.net.Uri
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -8,6 +9,8 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.huibenlema.app.data.local.AppDatabase
 import com.huibenlema.app.data.local.UserPrefs
+import com.huibenlema.app.data.log.AppLog
+import com.huibenlema.app.data.security.CredentialStatus
 import com.huibenlema.app.data.security.CredentialsManager
 import com.huibenlema.app.data.sync.AutoSyncScheduler
 import com.huibenlema.app.data.sync.SyncProgress
@@ -19,6 +22,7 @@ import com.huibenlema.app.domain.repo.BookRepository
 import com.huibenlema.app.domain.repo.SyncResult
 import com.huibenlema.app.ui.components.formatFen
 import dagger.hilt.android.lifecycle.HiltViewModel
+import dagger.hilt.android.qualifiers.ApplicationContext
 import javax.inject.Inject
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -36,8 +40,14 @@ class SettingsViewModel @Inject constructor(
     private val prefs: UserPrefs,
     private val db: AppDatabase,
     private val autoSyncScheduler: AutoSyncScheduler,
-    private val updateManager: UpdateManager
+    private val updateManager: UpdateManager,
+    @ApplicationContext private val appContext: Context
 ) : ViewModel() {
+
+    // 必须先于 init 块声明：lastSyncResult 带 replay 缓存，init 里的 collect 可能在构造期间
+    // 同步重放（viewModelScope=Main.immediate 立即执行），访问后声明的委托属性会 NPE 崩溃
+    var message by mutableStateOf<String?>(null)
+        private set
 
     init {
         // 同步结果统一反馈（手动/自动/后台/周期任务）
@@ -117,7 +127,11 @@ class SettingsViewModel @Inject constructor(
     val hasCredential: StateFlow<Boolean> = repo.observeHasCredential()
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), false)
 
-    val hasCookie: StateFlow<Boolean> = prefs.cookieCipher.map { !it.isNullOrBlank() }
+    /** 网页版登录态：Cookie 密文可解密且含 wr_skey（不再只看密文存在） */
+    val hasCookie: StateFlow<Boolean> = credentials.cookieOk
+
+    /** 凭证已失效（密文在但解不开）：登录卡片显示「请重新扫码登录」 */
+    val credentialBroken: StateFlow<Boolean> = credentials.status.map { it == CredentialStatus.BROKEN }
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), false)
 
     val syncProgress: StateFlow<SyncProgress> = repo.syncProgress
@@ -155,7 +169,6 @@ class SettingsViewModel @Inject constructor(
         private set
     var showClearConfirm by mutableStateOf(false)
         private set
-    var message by mutableStateOf<String?>(null)
 
     /** 同步进行中（全局状态：引导页后台同步、手动同步、自动同步均反映） */
     val syncing: StateFlow<Boolean> = repo.syncing
@@ -255,6 +268,7 @@ class SettingsViewModel @Inject constructor(
                 ClearAction.EVERYTHING -> {
                     db.clearAllTables()
                     credentials.clearAll()
+                    credentials.clearWebViewCookies() // WebView 登录态一并清（已无自愈逻辑，残留只会造成"已登录"误判）
                     prefs.setOnboardingDone(false)
                     prefs.setLastSyncAt(0L)
                 }
@@ -285,12 +299,14 @@ class SettingsViewModel @Inject constructor(
     fun confirmLogout() {
         showLogoutConfirm = false
         viewModelScope.launch {
-            credentials.clearCookie()
+            // 凭证全清 + WebView Cookie 罐全清：
+            // 只清 DataStore 的话，doSync 自愈或登录页判定会把 WebView 里的旧登录态读回来
+            credentials.clearAll()
+            credentials.clearWebViewCookies()
+            AppLog.i("HBCred", "logout")
             message = "已退出微信读书登录"
         }
     }
-
-    companion object
 
     // ---- 操作 ----
 
@@ -350,6 +366,7 @@ class SettingsViewModel @Inject constructor(
 
     /** 手动同步：后台执行（app 级 scope），进度与结果经全局流反馈 */
     fun sync() {
+        AppLog.i("HBSync", "sync_click settings syncing=${syncing.value}")
         if (syncing.value) return
         repo.syncInBackground()
     }
@@ -370,6 +387,13 @@ class SettingsViewModel @Inject constructor(
     fun exportData(uri: Uri) {
         viewModelScope.launch {
             if (!repo.exportData(uri)) message = "导出失败"
+        }
+    }
+
+    /** 导出应用日志（排查用）：成功静默，仅失败提示 */
+    fun exportLogs(uri: Uri) {
+        viewModelScope.launch {
+            if (!AppLog.exportTo(appContext, uri)) message = "日志导出失败"
         }
     }
 

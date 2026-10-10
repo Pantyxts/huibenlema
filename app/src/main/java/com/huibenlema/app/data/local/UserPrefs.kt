@@ -5,6 +5,7 @@ import androidx.datastore.core.DataStore
 import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
+import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.longPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.core.stringSetPreferencesKey
@@ -28,6 +29,7 @@ class UserPrefs @Inject constructor(@ApplicationContext private val context: Con
         val COOKIE_CIPHER = stringPreferencesKey("cookie_cipher")
         val CREDENTIAL_UPDATED_AT = longPreferencesKey("credential_updated_at")
         val LAST_SYNC_AT = longPreferencesKey("last_sync_at")
+        val LAST_SYNC_ATTEMPT_AT = longPreferencesKey("last_sync_attempt_at")
         val WIFI_ONLY = booleanPreferencesKey("wifi_only")
         val ONBOARDING_DONE = booleanPreferencesKey("onboarding_done")
         val AUTO_SYNC = booleanPreferencesKey("auto_sync")
@@ -38,15 +40,19 @@ class UserPrefs @Inject constructor(@ApplicationContext private val context: Con
         val LAST_UPDATE_CHECK_AT = longPreferencesKey("last_update_check_at")
         val PENDING_UPDATE_VERSION = stringPreferencesKey("pending_update_version")
         val IGNORED_UPDATE_VERSION = stringPreferencesKey("ignored_update_version")
+        val LAST_REBUILD_VERSION_CODE = intPreferencesKey("last_rebuild_version_code")
     }
 
     val apiKeyCipher: Flow<String?> = context.dataStore.data.map { it[Keys.API_KEY_CIPHER] }
     val cookieCipher: Flow<String?> = context.dataStore.data.map { it[Keys.COOKIE_CIPHER] }
     val credentialUpdatedAt: Flow<Long> = context.dataStore.data.map { it[Keys.CREDENTIAL_UPDATED_AT] ?: 0L }
     val lastSyncAt: Flow<Long> = context.dataStore.data.map { it[Keys.LAST_SYNC_AT] ?: 0L }
+    /** 最近一次同步尝试时间（成败都记）：自动同步节流用，失败后不更新 lastSyncAt 也能冷却 */
+    val lastSyncAttemptAt: Flow<Long> = context.dataStore.data.map { it[Keys.LAST_SYNC_ATTEMPT_AT] ?: 0L }
     val wifiOnly: Flow<Boolean> = context.dataStore.data.map { it[Keys.WIFI_ONLY] ?: true }
     val onboardingDone: Flow<Boolean> = context.dataStore.data.map { it[Keys.ONBOARDING_DONE] ?: false }
-    val autoSync: Flow<Boolean> = context.dataStore.data.map { it[Keys.AUTO_SYNC] ?: false }
+    /** 自动同步默认开启（老用户升级即获得启动同步 + 24h 定时；显式关闭过的用户不受影响） */
+    val autoSync: Flow<Boolean> = context.dataStore.data.map { it[Keys.AUTO_SYNC] ?: true }
     val registTime: Flow<Long> = context.dataStore.data.map { it[Keys.REGIST_TIME] ?: 0L }
     val accountName: Flow<String?> = context.dataStore.data.map { it[Keys.ACCOUNT_NAME] }
     val accountVid: Flow<String?> = context.dataStore.data.map { it[Keys.ACCOUNT_VID] }
@@ -55,6 +61,8 @@ class UserPrefs @Inject constructor(@ApplicationContext private val context: Con
     val lastUpdateCheckAt: Flow<Long> = context.dataStore.data.map { it[Keys.LAST_UPDATE_CHECK_AT] ?: 0L }
     val pendingUpdateVersion: Flow<String?> = context.dataStore.data.map { it[Keys.PENDING_UPDATE_VERSION] }
     val ignoredUpdateVersion: Flow<String?> = context.dataStore.data.map { it[Keys.IGNORED_UPDATE_VERSION] }
+    /** 上次完成每日价值重建时的 versionCode（升级后启动强制重建用） */
+    val lastRebuildVersionCode: Flow<Int> = context.dataStore.data.map { it[Keys.LAST_REBUILD_VERSION_CODE] ?: 0 }
 
     suspend fun setApiKeyCipher(value: String?) {
         context.dataStore.edit { p ->
@@ -76,6 +84,10 @@ class UserPrefs @Inject constructor(@ApplicationContext private val context: Con
         context.dataStore.edit { it[Keys.LAST_SYNC_AT] = value }
     }
 
+    suspend fun setLastSyncAttemptAt(value: Long) {
+        context.dataStore.edit { it[Keys.LAST_SYNC_ATTEMPT_AT] = value }
+    }
+
     suspend fun setWifiOnly(value: Boolean) {
         context.dataStore.edit { it[Keys.WIFI_ONLY] = value }
     }
@@ -86,6 +98,10 @@ class UserPrefs @Inject constructor(@ApplicationContext private val context: Con
 
     suspend fun setAutoSync(value: Boolean) {
         context.dataStore.edit { it[Keys.AUTO_SYNC] = value }
+    }
+
+    suspend fun setLastRebuildVersionCode(value: Int) {
+        context.dataStore.edit { it[Keys.LAST_REBUILD_VERSION_CODE] = value }
     }
 
     suspend fun setRegistTime(value: Long) {

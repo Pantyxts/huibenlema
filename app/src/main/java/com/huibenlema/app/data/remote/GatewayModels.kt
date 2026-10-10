@@ -8,6 +8,17 @@ sealed class GatewayResult<out T> {
     data class UpgradeRequired(val message: String) : GatewayResult<Nothing>()
 }
 
+/** /book/info 书籍基本信息（官方通道，无价格） */
+data class BookInfoDto(
+    val bookId: String,
+    val author: String = "",
+    val translator: String = "",
+    val publisher: String = "",
+    val isbn: String = "",
+    val cover: String = "",
+    val category: String = ""
+)
+
 /** /shelf/sync 书籍条目 */
 data class ShelfBookDto(
     val bookId: String,
@@ -37,16 +48,13 @@ data class ProgressDto(
     val finished: Boolean get() = finishTime > 0
 
     /**
-     * 计入价值的有效进度：已读完且进度接近读完（≥99）时强制 100%（修复"已读完显示 99%"）；
-     * 已读完但远端进度为 0（部分读完书微信读书不返回进度数据）同样按 100% 计；
-     * 进度明显回落（如重读，0 < progress < 99）时按实际进度计。
+     * 计入价值的有效进度：已读完（finishTime > 0）一律按 100% 计——
+     * 微信读书标记读完的书 progress 可能是 99/0/或只看过的低进度（用户手动标记读完），
+     * 远端读完信号是唯一判定依据；未读完按实际进度。
+     * （读完规则单一事实来源：flushProgressBatch / resyncBookProgress / resyncBooksProgress / 补捞 全部复用此处）
      */
     val effectiveRatio: Double
-        get() = when {
-            finished && progressRatio >= 0.99 -> 1.0
-            finished && progressRatio <= 0.0 -> 1.0
-            else -> progressRatio
-        }
+        get() = if (finished) 1.0 else progressRatio
 }
 
 /** /user/notebooks 中的书籍价格（官方批量定价通道） */
@@ -73,4 +81,9 @@ data class ReadDataDto(
 )
 
 /** readLongest 榜单条目 */
-data class LongestBookDto(val bookId: String, val title: String)
+data class LongestBookDto(
+    val bookId: String,
+    val title: String,
+    /** 该周期（月）内的阅读秒数——分辨"起始日后读了哪些书、读了多少"的依据 */
+    val readTime: Long = 0L
+)

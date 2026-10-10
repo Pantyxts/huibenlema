@@ -1,12 +1,16 @@
 package com.huibenlema.app.ui.login
 
 import android.annotation.SuppressLint
-import android.content.Context
 import android.webkit.CookieManager
+import android.webkit.RenderProcessGoneDetail
+import android.webkit.WebChromeClient
+import android.webkit.WebResourceError
+import android.webkit.WebResourceRequest
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -18,6 +22,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -30,54 +35,18 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.hilt.navigation.compose.hiltViewModel
-import androidx.lifecycle.ViewModel
-import androidx.lifecycle.viewModelScope
-import com.huibenlema.app.data.security.CredentialsManager
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.huibenlema.app.data.log.AppLog
 import com.huibenlema.app.ui.components.EinkButton
 import com.huibenlema.app.ui.theme.GrayDark
-import dagger.hilt.android.lifecycle.HiltViewModel
-import javax.inject.Inject
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
-import kotlinx.coroutines.launch
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.withContext
+import kotlin.coroutines.resume
 
 /** 扫码登录：WebView 加载微信读书网页，登录成功后自动提取 Cookie 并加密保存 */
-@HiltViewModel
-class LoginViewModel @Inject constructor(
-    private val credentials: CredentialsManager
-) : ViewModel() {
-
-    var loggedIn by mutableStateOf(false)
-        private set
-
-    /** 进入登录页时重置状态：ViewModel 是单例，防止上次成功态残留导致页面闪退 */
-    fun enter() {
-        loggedIn = false
-    }
-
-    fun onPageFinished(cookie: String) {
-        if (!loggedIn && isLoggedInCookie(cookie)) saveAndDone(cookie)
-    }
-
-    fun pollCookie(cookie: String) {
-        if (!loggedIn && isLoggedInCookie(cookie)) saveAndDone(cookie)
-    }
-
-    private fun saveAndDone(cookie: String) {
-        viewModelScope.launch {
-            credentials.saveCookie(cookie)
-            // 扫码登录后自动获取官方 API Key（api/skills/apikeyGet），一步完成全部授权
-            credentials.fetchAndSaveApiKey(cookie)
-            loggedIn = true
-        }
-    }
-
-    companion object {
-        /** 严格校验：必须含会话密钥 wr_skey（仅 wr_vid 不足以调用定价接口） */
-        fun isLoggedInCookie(cookie: String): Boolean = cookie.contains("wr_skey")
-    }
-}
-
 @SuppressLint("SetJavaScriptEnabled")
 @Composable
 fun LoginScreen(
@@ -85,36 +54,32 @@ fun LoginScreen(
     onClose: () -> Unit,
     onLoginSuccess: () -> Unit = {}
 ) {
-    val context = LocalContext.current
+    val state by vm.state.collectAsStateWithLifecycle()
+    val alreadyLoggedState by vm.alreadyLogged.collectAsStateWithLifecycle()
     var forceRelogin by remember { mutableStateOf(false) }
-    var sessionReady by remember { mutableStateOf(false) }
-    // 设备 Cookie 存储已有登录态（曾扫码成功）→ 展示状态页而非闪退
-    val alreadyLogged = !forceRelogin && getWereadCookie(context).contains("wr_skey")
+    var webViewKey by remember { mutableStateOf(0) }
 
     // 进入时重置上次的登录成功状态（防止残留导致闪退循环）
-    LaunchedEffect(Unit) {
-        vm.enter()
-        sessionReady = true
+    LaunchedEffect(Unit) { vm.enter() }
+
+    // 离开登录页：停止 Cookie 轮询（页面已关不再空转）
+    DisposableEffect(Unit) {
+        onDispose { vm.onExit() }
     }
-    // 登录成功 → 自动同步一次并关闭（仅在本次会话内响应）
-    LaunchedEffect(sessionReady, vm.loggedIn) {
-        if (sessionReady && vm.loggedIn) {
+
+    // 登录成功 → 自动同步一次并关闭（本次会话内只处理一次）
+    var successHandled by remember { mutableStateOf(false) }
+    LaunchedEffect(state) {
+        if (state is LoginUiState.Success && !successHandled) {
+            successHandled = true
             onLoginSuccess()
+            delay(800) // 给用户看到"登录成功"的瞬间
             onClose()
         }
     }
-    // 轮询登录态（仅未登录时）
-    LaunchedEffect(alreadyLogged) {
-        if (alreadyLogged) return@LaunchedEffect
-        while (isActive) {
-            vm.pollCookie(getWereadCookie(context))
-            if (vm.loggedIn) break
-            delay(1500)
-        }
-    }
 
-    if (alreadyLogged) {
-        // 已登录状态页
+    if (!forceRelogin && alreadyLoggedState) {
+        // 已登录状态页（判定数据源 = 加密存储的 Cookie 可解密，不再读 WebView Cookie 库）
         Column(
             Modifier
                 .fillMaxSize()
@@ -134,9 +99,8 @@ fun LoginScreen(
             EinkButton(
                 text = "退出并重新登录",
                 onClick = {
-                    CookieManager.getInstance().removeAllCookies(null)
-                    CookieManager.getInstance().flush()
                     forceRelogin = true
+                    vm.relogin()
                 },
                 modifier = Modifier.fillMaxWidth()
             )
@@ -155,106 +119,234 @@ fun LoginScreen(
         ) {
             TextButton(onClick = onClose) { Text("返回") }
             Text("微信扫码登录微信读书", style = MaterialTheme.typography.titleMedium)
+            Spacer(Modifier.weight(1f))
+            if (state is LoginUiState.Qr) {
+                TextButton(onClick = vm::manualRefresh) { Text("刷新二维码", color = GrayDark) }
+            }
         }
         Text(
-            "页面加载后会自动弹出登录二维码（过期会自动刷新）。若未弹出，请点击网页「登录」；" +
-                "微信扫码后请尽快确认，确认成功自动完成登录。",
+            "页面加载后会自动弹出登录二维码。微信扫码后请点「我已扫码」，然后尽快在手机上确认；" +
+                "过期会自动刷新，手动刷新会使旧码作废。",
             style = MaterialTheme.typography.bodySmall,
             color = GrayDark,
             modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp)
         )
-        AndroidView(
-            modifier = Modifier.weight(1f),
-            factory = { ctx ->
-                WebView(ctx).apply {
-                    settings.javaScriptEnabled = true
-                    settings.domStorageEnabled = true
-                    settings.userAgentString = MOBILE_UA
-                    webViewClient = object : WebViewClient() {
-                        override fun onPageFinished(view: WebView?, url: String?) {
-                            super.onPageFinished(view, url)
-                            view?.let {
-                                injectAutoLoginClick(it)
-                                // 二维码过期时自动点击「刷新二维码」，避免用户卡在失效页面
-                                injectAutoRefreshQr(it)
-                            }
-                            vm.onPageFinished(getWereadCookie(ctx))
-                        }
-                    }
-                    loadUrl("https://weread.qq.com/")
+
+        // 状态行（白屏问题的根治之一：任何异常都有可见反馈，不再是纯白页面）
+        val statusLine = when (val s = state) {
+            is LoginUiState.Loading -> "页面加载中…"
+            is LoginUiState.Qr -> when {
+                s.scanned -> "已扫描，请在手机上确认"
+                s.refreshing -> "正在刷新二维码…"
+                s.expired -> "二维码已失效，正在自动刷新…"
+                s.hasQr -> "二维码已显示，请用微信扫码"
+                else -> "等待二维码显示…"
+            }
+            is LoginUiState.Saving -> "正在保存登录信息…"
+            is LoginUiState.Success -> "登录成功"
+            is LoginUiState.Error -> s.message
+        }
+        Text(
+            statusLine,
+            style = MaterialTheme.typography.bodyMedium,
+            modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp)
+        )
+
+        when (state) {
+            is LoginUiState.Error -> {
+                // 错误页：可重试（重建 WebView），不再是无响应的白屏
+                Column(
+                    Modifier
+                        .fillMaxSize()
+                        .padding(horizontal = 24.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.Center
+                ) {
+                    Spacer(Modifier.height(12.dp))
+                    EinkButton(
+                        text = "重试",
+                        onClick = {
+                            webViewKey++
+                            vm.enter()
+                        },
+                        modifier = Modifier.fillMaxWidth()
+                    )
                 }
             }
-        )
+            else -> {
+                Box(Modifier.weight(1f)) {
+                    WebViewArea(vm, webViewKey)
+                }
+            }
+        }
+
+        // 操作区：「我已扫码」锁定 + 手动刷新（Qr 且未扫描时）
+        val qr = state as? LoginUiState.Qr
+        if (qr != null && !qr.scanned && state !is LoginUiState.Error) {
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp, vertical = 8.dp),
+                horizontalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                EinkButton(
+                    text = "我已扫码",
+                    onClick = vm::onMarkScanned,
+                    modifier = Modifier.weight(1f)
+                )
+                EinkButton(
+                    text = "刷新二维码",
+                    onClick = vm::manualRefresh,
+                    modifier = Modifier.weight(1f)
+                )
+            }
+        }
+        Spacer(Modifier.height(8.dp))
     }
 }
 
-private fun getWereadCookie(context: Context): String = try {
-    CookieManager.getInstance().getCookie("https://weread.qq.com/") ?: ""
-} catch (_: Exception) {
-    ""
-}
+/** WebView 区域：创建防护 + 渲染进程死亡处理 + 销毁回收 + JS 桥（状态上报轮询） */
+@SuppressLint("SetJavaScriptEnabled")
+@Composable
+private fun WebViewArea(vm: LoginViewModel, webViewKey: Int) {
+    val context = LocalContext.current
+    val webView = remember(webViewKey) {
+        AppLog.i("HBLogin", "webview_create_begin")
+        val t0 = System.currentTimeMillis()
+        runCatching {
+            WebView(context).apply {
+                settings.javaScriptEnabled = true
+                settings.domStorageEnabled = true
+                settings.userAgentString = QrLoginJs.MOBILE_UA
+                // 扫码登录依赖微信跨站 iframe 的 Cookie，必须开启第三方 Cookie
+                CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
+                webViewClient = object : WebViewClient() {
+                    override fun onPageFinished(view: WebView?, url: String?) {
+                        super.onPageFinished(view, url)
+                        AppLog.i("HBLogin", "page_finished url=$url")
+                        // runCatching：destroy 后迟到的回调在此注入会抛异常
+                        view?.let { runCatching { it.evaluateJavascript(QrLoginJs.INIT, null) } }
+                    }
 
-/** 页面加载后自动点击「登录」按钮，直接弹出二维码弹窗（重试多次等待 SPA 渲染完成） */
-private fun injectAutoLoginClick(view: WebView) {
-    val js = """
-        (function() {
-          var tries = 0;
-          var done = false;
-          // 登录弹窗已打开（存在微信二维码 iframe）则不再点击「登录」，
-          // 避免重复点击导致二维码被刷新、用户扫到旧码
-          function qrOpened() {
-            var iframes = document.querySelectorAll('iframe');
-            for (var i = 0; i < iframes.length; i++) {
-              if ((iframes[i].src || '').indexOf('open.weixin.qq.com') >= 0) return true;
-            }
-            return false;
-          }
-          function clickLogin() {
-            tries++;
-            if (tries > 15 || done) return;
-            if (qrOpened()) { done = true; return; }
-            var els = document.querySelectorAll('a,button,div,span');
-            for (var i = 0; i < els.length; i++) {
-              var t = (els[i].textContent || '').trim();
-              if (t === '登录' && els[i].offsetParent !== null) {
-                els[i].click();
-                done = true;
-                return;
-              }
-            }
-            setTimeout(clickLogin, 800);
-          }
-          setTimeout(clickLogin, 800);
-        })();
-    """.trimIndent()
-    view.evaluateJavascript(js, null)
-}
+                    // 渲染进程死亡：返回 true 自处理（默认 false 会连带杀整个 App）
+                    override fun onRenderProcessGone(view: WebView?, detail: RenderProcessGoneDetail?): Boolean {
+                        AppLog.e("HBLogin", "render_gone didCrash=${detail?.didCrash()}")
+                        vm.onRenderProcessGone(detail?.didCrash() == true)
+                        return true
+                    }
 
-/**
- * 二维码有效期短（用户扫码确认稍慢就会过期），定期检测失效提示
- * （「点击刷新二维码」/「二维码已失效」）并自动点击刷新，保证随时扫到的都是有效二维码。
- */
-private fun injectAutoRefreshQr(view: WebView) {
-    val js = """
-        (function() {
-          if (window.__hbRefreshQr) return; // onPageFinished 可能多次触发，防止重复注入
-          window.__hbRefreshQr = true;
-          setInterval(function() {
-            var els = document.querySelectorAll('a,button,div,span');
-            for (var i = 0; i < els.length; i++) {
-              var t = (els[i].textContent || '').trim();
-              if ((t.indexOf('点击刷新二维码') >= 0 || t.indexOf('二维码已失效') >= 0) &&
-                  els[i].offsetParent !== null) {
-                els[i].click();
-                break;
-              }
-            }
-          }, 1500);
-        })();
-    """.trimIndent()
-    view.evaluateJavascript(js, null)
-}
+                    override fun onReceivedError(
+                        view: WebView?,
+                        request: WebResourceRequest?,
+                        error: WebResourceError?
+                    ) {
+                        if (request?.isForMainFrame == true) {
+                            vm.onPageError(
+                                error?.errorCode ?: -1,
+                                error?.description?.toString(),
+                                request.url?.toString()
+                            )
+                        }
+                    }
 
-/** 桌面版 UA：确保展示网页版（含「登录」入口与扫码弹窗），手机 UA 会跳到无登录入口的手机版首页 */
-private const val MOBILE_UA =
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                    override fun onReceivedHttpError(
+                        view: WebView?,
+                        request: WebResourceRequest?,
+                        errorResponse: android.webkit.WebResourceResponse?
+                    ) {
+                        AppLog.w("HBLogin", "http_error code=${errorResponse?.statusCode} url=${request?.url}")
+                    }
+                }
+                webChromeClient = object : WebChromeClient() {
+                    override fun onConsoleMessage(cm: android.webkit.ConsoleMessage?): Boolean {
+                        cm?.let { AppLog.i("HBLogin", "console ${it.message()}") }
+                        return true
+                    }
+                }
+                loadUrl("https://weread.qq.com/")
+            }.also {
+                AppLog.i("HBLogin", "webview_create_ok in ${System.currentTimeMillis() - t0}ms")
+            }
+        }.onFailure { e ->
+            AppLog.e("HBLogin", "webview_create_fail in ${System.currentTimeMillis() - t0}ms", e)
+            vm.onWebViewCreateFailed(e.javaClass.simpleName)
+        }.getOrNull()
+    }
+
+    if (webView == null) {
+        // 创建失败：错误页由 vm state 渲染（此分支只占位）
+        return
+    }
+
+    // WebView 就绪 → 启动 Cookie 轮询（就绪前触碰 CookieManager 会与 WebView 创建互等）
+    LaunchedEffect(webView) { vm.onWebViewReady() }
+
+    // JS 状态轮询（1s）：页面重载丢 window.__hb 时重新注入。
+    // 全部 JS 调用 runCatching：登录页关闭（WebView destroy）与轮询存在竞态，
+    // 在已销毁的 WebView 上 evaluateJavascript 会抛异常 → 未捕获直接崩溃进程
+    LaunchedEffect(webView) {
+        while (isActive) {
+            delay(1_000)
+            val raw = withContext(Dispatchers.Main) {
+                runCatching {
+                    suspendCancellableCoroutine { cont ->
+                        webView.evaluateJavascript(QrLoginJs.REPORT) { value -> cont.resume(value) }
+                    }
+                }.getOrNull()
+            } ?: continue
+            if (raw.isNullOrBlank() || raw == "null") {
+                withContext(Dispatchers.Main) {
+                    runCatching { webView.evaluateJavascript(QrLoginJs.INIT, null) }
+                }
+                continue
+            }
+            val parts = raw.trim('"').split(',')
+            if (parts.size == 4) {
+                vm.onQrReport(
+                    hasQr = parts[1] == "1",
+                    expired = parts[2] == "1",
+                    scanned = parts[3] == "1"
+                )
+            }
+        }
+    }
+
+    // App 下发的二维码刷新动作（JS 永不自行点击）
+    LaunchedEffect(webView) {
+        vm.refreshRequests.collect { action ->
+            when (action) {
+                QrRefreshAction.CLICK -> {
+                    val clicked = withContext(Dispatchers.Main) {
+                        runCatching {
+                            suspendCancellableCoroutine { cont ->
+                                webView.evaluateJavascript(QrLoginJs.CLICK_REFRESH) { v ->
+                                    cont.resume(v.trim('"') == "true")
+                                }
+                            }
+                        }.getOrDefault(false)
+                    }
+                    vm.onRefreshClickResult(clicked)
+                }
+                QrRefreshAction.RELOAD -> {
+                    withContext(Dispatchers.Main) {
+                        runCatching {
+                            webView.evaluateJavascript(QrLoginJs.INIT, null)
+                            webView.reload()
+                        }
+                    }
+                    AppLog.i("HBLogin", "qr_reload_done")
+                }
+            }
+        }
+    }
+
+    AndroidView(
+        modifier = Modifier.fillMaxSize(),
+        factory = { webView },
+        onRelease = {
+            AppLog.i("HBWeb", "destroy")
+            it.stopLoading()
+            it.destroy()
+        }
+    )
+}

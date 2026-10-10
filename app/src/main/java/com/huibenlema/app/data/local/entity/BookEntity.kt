@@ -25,6 +25,8 @@ data class BookEntity(
     /** 累计阅读时长（秒） */
     val totalReadSeconds: Long = 0L,
     val lastReadAt: Long = 0L,
+    /** 书架最近一次阅读更新时间（秒）：判断"某时间之后读过哪些书"的依据（起始日口径兜底） */
+    val readUpdateTime: Long = 0L,
     /** 最近一次拉取进度的时间（增量同步：远端 readUpdateTime 超过它才重新拉） */
     val progressFetchedAt: Long = 0L,
     /** 进度是否手动调节过（书值页显示「（手动）」标记；同步取较长者，被远端覆盖时清除） */

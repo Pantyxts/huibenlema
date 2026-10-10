@@ -24,7 +24,6 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -67,13 +66,6 @@ fun HomeScreen(
     val bookSlices by vm.bookSlices.collectAsStateWithLifecycle()
     val selectedDay by vm.selectedDay.collectAsStateWithLifecycle()
     val syncProgress by vm.syncProgress.collectAsStateWithLifecycle()
-    val efficiency by vm.efficiencyFenPerHour.collectAsStateWithLifecycle()
-
-    // 柱状图数据：每日价值 = 官方每日时长 × 平均效率（时长准确，价值为全局平均估算）
-    val chartStats = remember(dailyStats, efficiency) {
-        if (efficiency <= 0) dailyStats.map { it.copy(valueFen = 0L) }
-        else dailyStats.map { it.copy(valueFen = it.readSeconds * efficiency / 3600) }
-    }
 
     Column(
         Modifier
@@ -86,6 +78,11 @@ fun HomeScreen(
         // 同步进度条（页面顶部：同步区块在页面底部，进度条放这里才可见）
         if (syncing) {
             SyncProgressBar(syncProgress.percent, syncProgress.label)
+            Spacer(Modifier.height(12.dp))
+        }
+        // 同步结果消息（页面顶部：此前在页面底部，同步失败等反馈用户几乎看不到）
+        message?.let {
+            Text(it, style = MaterialTheme.typography.bodySmall, fontWeight = FontWeight.Bold)
             Spacer(Modifier.height(12.dp))
         }
 
@@ -142,7 +139,7 @@ fun HomeScreen(
                 }
                 Spacer(Modifier.height(8.dp))
                 DailyBarChart(
-                    stats = chartStats,
+                    stats = dailyStats,
                     days = days,
                     selectedDate = selectedDay,
                     onSelect = vm::selectDay
@@ -150,11 +147,10 @@ fun HomeScreen(
             }
         }
 
-        // 选中日的明细：官方时长（准确）+ 按平均效率估算的价值
+        // 选中日的明细：真实每日价值（重建产出）+ 官方时长
         val selDay = selectedDay
         if (selDay != null) {
             val dayStat = dailyStats.find { it.date == selDay }
-            val estValue = if (efficiency > 0) ((dayStat?.readSeconds ?: 0L) * efficiency / 3600) else 0L
             Spacer(Modifier.height(12.dp))
             Card(
                 Modifier.fillMaxWidth(),
@@ -166,15 +162,19 @@ fun HomeScreen(
                     Text(formatCnDate(selDay), style = MaterialTheme.typography.titleMedium)
                     Spacer(Modifier.height(6.dp))
                     Text(
-                        "价值：${if (efficiency > 0) formatFen(estValue) else "--"}",
+                        "价值：${formatFen(dayStat?.valueFen ?: 0L)}",
                         style = MaterialTheme.typography.bodyMedium
                     )
                     Text(
                         "时间：${dayStat?.readSeconds?.let { formatReadSeconds(it) } ?: "--"}",
                         style = MaterialTheme.typography.bodyMedium
                     )
+                    // 价值/时间：当日自算（不再用全局平均效率）
+                    val perHour = dayStat?.let {
+                        if (it.readSeconds > 0) it.valueFen * 3600 / it.readSeconds else null
+                    }
                     Text(
-                        "价值/时间：${if (efficiency > 0) formatFen(efficiency) + "/小时" else "--"}",
+                        "价值/时间：${perHour?.let { formatFen(it) + "/小时" } ?: "--"}",
                         style = MaterialTheme.typography.bodyMedium
                     )
                 }
@@ -231,17 +231,11 @@ fun HomeScreen(
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically
         ) {
-            Column(Modifier.weight(1f)) {
-                Text(
-                    "上次同步：${formatSyncTime(lastSyncAt)}",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = GrayDark
-                )
-                message?.let {
-                    Spacer(Modifier.height(4.dp))
-                    Text(it, style = MaterialTheme.typography.bodySmall, fontWeight = FontWeight.Bold)
-                }
-            }
+            Text(
+                "上次同步：${formatSyncTime(lastSyncAt)}",
+                style = MaterialTheme.typography.bodySmall,
+                color = GrayDark
+            )
             Spacer(Modifier.width(12.dp))
             EinkButton(
                 text = if (syncing) "同步中…" else "立即同步",

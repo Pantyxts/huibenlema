@@ -77,6 +77,7 @@ import java.time.LocalDate
 fun SettingsScreen(vm: SettingsViewModel = hiltViewModel()) {
     val costItems by vm.costItems.collectAsStateWithLifecycle()
     val hasCookie by vm.hasCookie.collectAsStateWithLifecycle()
+    val credentialBroken by vm.credentialBroken.collectAsStateWithLifecycle()
     val lastSyncAt by vm.lastSyncAt.collectAsStateWithLifecycle()
     val autoSync by vm.autoSync.collectAsStateWithLifecycle()
     val syncProgress by vm.syncProgress.collectAsStateWithLifecycle()
@@ -110,6 +111,11 @@ fun SettingsScreen(vm: SettingsViewModel = hiltViewModel()) {
     val importLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.OpenDocument()
     ) { uri -> uri?.let { vm.requestImport(it) } }
+
+    // 日志导出：SAF 保存位置（排查问题用，用户设备不用 adb）
+    val logLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.CreateDocument("text/plain")
+    ) { uri -> uri?.let { vm.exportLogs(it) } }
 
     if (vm.showLogin) {
         LoginScreen(onClose = vm::closeLogin, onLoginSuccess = vm::sync)
@@ -189,9 +195,13 @@ fun SettingsScreen(vm: SettingsViewModel = hiltViewModel()) {
             colors = CardDefaults.cardColors(containerColor = Color.White)
         ) {
             Column(Modifier.padding(12.dp)) {
-                // 登录信息主体
+                // 登录信息主体（凭证已失效 = 密文在但解不开，与"未登录"区分提示）
                 Text(
-                    if (hasCookie) "已扫码登录" else "未登录",
+                    when {
+                        credentialBroken -> "登录凭证已失效，请重新扫码登录"
+                        hasCookie -> "已扫码登录"
+                        else -> "未登录"
+                    },
                     style = MaterialTheme.typography.bodyLarge,
                     fontWeight = FontWeight.Bold
                 )
@@ -327,6 +337,9 @@ fun SettingsScreen(vm: SettingsViewModel = hiltViewModel()) {
                     ) {
                         Text(if (updateState is UpdateManager.UpdateState.Checking) "检查中…" else "检查更新")
                     }
+                }
+                DataActionRow("导出日志") {
+                    logLauncher.launch("huibenlema-log-${LocalDate.now()}.txt")
                 }
             }
         }

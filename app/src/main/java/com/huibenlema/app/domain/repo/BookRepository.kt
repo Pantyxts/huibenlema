@@ -1,6 +1,7 @@
 package com.huibenlema.app.domain.repo
 
 import android.net.Uri
+import com.huibenlema.app.data.security.CredentialStatus
 import com.huibenlema.app.data.sync.SyncProgress
 import com.huibenlema.app.domain.model.Book
 import com.huibenlema.app.domain.model.BookDayStat
@@ -98,6 +99,9 @@ interface BookRepository {
 
     fun observeHasCredential(): Flow<Boolean>
 
+    /** 凭证可用性状态（可解密判定；BROKEN = 密文存在但密钥丢失，需重新登录） */
+    fun credentialStatus(): Flow<CredentialStatus>
+
     /** 同步进度（0-100 + 阶段说明） */
     val syncProgress: Flow<SyncProgress>
 
@@ -182,6 +186,9 @@ interface BookRepository {
 
     /** 手动同步（主路径） */
     suspend fun sync(): SyncResult
+
+    /** 本地重建每日价值（升级后强制重建用；与同步共用互斥锁） */
+    suspend fun rebuildDailyValues()
 
     /** 数据导出：书籍 + 成本台账 + 每日统计 → JSON 写入目标 Uri；凭证不导出 */
     suspend fun exportData(uri: Uri): Boolean

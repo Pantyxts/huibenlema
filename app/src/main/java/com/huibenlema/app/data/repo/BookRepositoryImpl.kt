@@ -9,6 +9,8 @@ import com.huibenlema.app.data.local.dao.DailyBookStatDao
 import com.huibenlema.app.data.local.dao.DailyStatDao
 import com.huibenlema.app.data.local.toDomain
 import com.huibenlema.app.data.local.toEntity
+import com.huibenlema.app.data.log.AppLog
+import com.huibenlema.app.data.security.CredentialStatus
 import com.huibenlema.app.data.security.CredentialsManager
 import com.huibenlema.app.data.sync.SyncManager
 import com.huibenlema.app.data.sync.SyncProgress
@@ -16,10 +18,8 @@ import com.huibenlema.app.data.sync.SyncProgressTracker
 import com.huibenlema.app.domain.calculator.PaybackCalculator
 import com.huibenlema.app.data.local.entity.BookEntity
 import com.huibenlema.app.data.local.entity.CostItemEntity
-import com.huibenlema.app.data.local.entity.DailyStatEntity
 import com.huibenlema.app.domain.model.BackupBook
 import com.huibenlema.app.domain.model.BackupCost
-import com.huibenlema.app.domain.model.BackupDailyStat
 import com.huibenlema.app.domain.model.BackupFile
 import com.huibenlema.app.domain.model.CostCategory
 import com.huibenlema.app.domain.model.PriceSource
@@ -34,18 +34,19 @@ import com.huibenlema.app.domain.repo.BookRepository
 import com.huibenlema.app.domain.repo.ResyncPriceResult
 import com.huibenlema.app.domain.repo.ResyncProgressResult
 import com.huibenlema.app.domain.repo.SyncResult
-import java.time.LocalDate
 import dagger.hilt.android.qualifiers.ApplicationContext
 import javax.inject.Inject
 import javax.inject.Singleton
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.flowOn
@@ -83,8 +84,30 @@ class BookRepositoryImpl @Inject constructor(
     private val _syncing = MutableStateFlow(false)
     override val syncing: Flow<Boolean> = _syncing.asStateFlow()
 
-    private val _lastSyncResult = MutableSharedFlow<SyncResult>(extraBufferCapacity = 8)
+    // replay=1：同步结果不再因订阅时机丢失（启动瞬间 Worker 完成的结果进入页面也能收到）
+    private val _lastSyncResult = MutableSharedFlow<SyncResult>(replay = 1, extraBufferCapacity = 8)
     override val lastSyncResult: Flow<SyncResult> = _lastSyncResult.asSharedFlow()
+
+    /**
+     * 每日价值重建请求（conflated + 1.5s debounce）：
+     * 所有本地写（改价/改进度/隐藏/删除等）都会影响价值，批量操作上百次写合并为一次重建；
+     * 与同步共用 syncMutex 避免并发写库。
+     */
+    private val rebuildRequested = MutableStateFlow(0L)
+
+    init {
+        appScope.launch {
+            rebuildRequested.collectLatest { ts ->
+                if (ts <= 0) return@collectLatest
+                delay(REBUILD_DEBOUNCE_MS)
+                syncMutex.withLock { syncManager.rebuildDailyValuesNow() }
+            }
+        }
+    }
+
+    private fun requestValueRebuild() {
+        rebuildRequested.value = System.currentTimeMillis()
+    }
 
     override val syncProgress: Flow<SyncProgress> = progressTracker.state
 
@@ -128,18 +151,20 @@ class BookRepositoryImpl @Inject constructor(
             )
         }.flowOn(Dispatchers.Default)
 
-    override fun observeDailyStats(days: Int): Flow<List<DailyStat>> {
-        val from = LocalDate.now().minusDays(days - 1L).toString()
-        return dailyStatDao.observeFrom(from, days).map { list -> list.map { it.toDomain() } }
-    }
+    override fun observeDailyStats(days: Int): Flow<List<DailyStat>> =
+        // 倒序取最新 N 条再反转为升序：查询窗口不冻结，跨零点后最新一天立即可见
+        dailyStatDao.observeRecent(days).map { list -> list.asReversed().map { it.toDomain() } }
 
     override fun observeCostItems(): Flow<List<CostItem>> =
         costItemDao.observeAll().map { list -> list.map { it.toDomain() } }
 
     override fun observeLastSyncAt(): Flow<Long> = prefs.lastSyncAt
 
+    /** 登录态 = 可解密（密文存在但密钥丢失时不再显示"已登录"） */
     override fun observeHasCredential(): Flow<Boolean> =
-        prefs.apiKeyCipher.map { !it.isNullOrBlank() }
+        credentials.status.map { it == CredentialStatus.OK }
+
+    override fun credentialStatus(): Flow<CredentialStatus> = credentials.status
 
     override suspend fun addCostItem(item: CostItem): Long = costItemDao.insert(item.toEntity())
 
@@ -147,11 +172,15 @@ class BookRepositoryImpl @Inject constructor(
 
     override suspend fun deleteCostItem(id: Long) = costItemDao.delete(id)
 
-    override suspend fun updatePriceManual(bookId: String, priceFen: Long) =
+    override suspend fun updatePriceManual(bookId: String, priceFen: Long) {
         bookDao.updatePriceManual(bookId, priceFen, System.currentTimeMillis())
+        requestValueRebuild()
+    }
 
-    override suspend fun saveOfficialPrice(bookId: String, priceFen: Long) =
+    override suspend fun saveOfficialPrice(bookId: String, priceFen: Long) {
         bookDao.updatePriceForce(bookId, priceFen, PriceSource.WEREAD, System.currentTimeMillis())
+        requestValueRebuild()
+    }
 
     override suspend fun addCustomBook(title: String, author: String, priceFen: Long?, progressPct: Int) {
         val now = System.currentTimeMillis()
@@ -174,32 +203,40 @@ class BookRepositoryImpl @Inject constructor(
                 )
             )
         )
+        requestValueRebuild()
     }
 
-    override suspend fun updateBookProgress(bookId: String, progressPct: Int) =
+    override suspend fun updateBookProgress(bookId: String, progressPct: Int) {
         bookDao.updateBookProgress(
             bookId = bookId,
             progress = progressPct.coerceIn(0, 100) / 100.0,
             finished = progressPct >= 100,
             ts = System.currentTimeMillis()
         )
+        requestValueRebuild()
+    }
 
-    override suspend fun setBookHidden(bookId: String, hidden: Boolean) =
+    override suspend fun setBookHidden(bookId: String, hidden: Boolean) {
         bookDao.setHidden(bookId, hidden, System.currentTimeMillis())
+        requestValueRebuild()
+    }
 
     override suspend fun markBooksFinished(bookIds: List<String>) {
         // 分批执行：SQLite 单语句参数上限（老设备 999），万本全选也不越界
         val now = System.currentTimeMillis()
         bookIds.chunked(500).forEach { bookDao.markFinishedBatch(it, now) }
+        requestValueRebuild()
     }
 
     override suspend fun setBooksHidden(bookIds: List<String>, hidden: Boolean) {
         val now = System.currentTimeMillis()
         bookIds.chunked(500).forEach { bookDao.setHiddenBatch(it, hidden, now) }
+        requestValueRebuild()
     }
 
     override suspend fun deleteBooks(bookIds: List<String>) {
         bookIds.chunked(500).forEach { bookDao.deleteCustomBatch(it) }
+        requestValueRebuild()
     }
 
     override suspend fun resyncBooksPrice(
@@ -234,13 +271,25 @@ class BookRepositoryImpl @Inject constructor(
         return syncManager.resyncBooksProgress(bookIds, key, onProgress)
     }
 
-    override suspend fun deleteBook(bookId: String) = bookDao.deleteBook(bookId)
+    override suspend fun deleteBook(bookId: String) {
+        bookDao.deleteBook(bookId)
+        requestValueRebuild()
+    }
 
-    override suspend fun clearAllBooks() = bookDao.deleteAllBooks()
+    override suspend fun clearAllBooks() {
+        bookDao.deleteAllBooks()
+        requestValueRebuild()
+    }
 
-    override suspend fun clearNonManualBooks() = bookDao.deleteNonManualBooks()
+    override suspend fun clearNonManualBooks() {
+        bookDao.deleteNonManualBooks()
+        requestValueRebuild()
+    }
 
-    override suspend fun clearManualBooks() = bookDao.deleteManualBooks()
+    override suspend fun clearManualBooks() {
+        bookDao.deleteManualBooks()
+        requestValueRebuild()
+    }
 
     override suspend fun clearCostItems() = costItemDao.deleteAll()
 
@@ -254,50 +303,65 @@ class BookRepositoryImpl @Inject constructor(
         return syncManager.resyncBookProgress(bookId, key)
     }
 
-    override suspend fun saveRestoredProgress(bookId: String, progressPct: Int) =
+    override suspend fun saveRestoredProgress(bookId: String, progressPct: Int) {
         syncManager.applyRestoredProgress(bookId, progressPct)
+        requestValueRebuild()
+    }
 
     override suspend fun getDailyBookStats(date: String): List<BookDayStat> =
         dailyBookStatDao.getForDate(date).map {
             BookDayStat(bookId = it.bookId, title = it.title ?: "未知书名", valueFen = it.valueFen)
         }
 
-    override suspend fun sync(): SyncResult = syncMutex.withLock {
-        _syncing.value = true
-        try {
-            doSync().also { _lastSyncResult.tryEmit(it) }
-        } finally {
-            _syncing.value = false
+    override suspend fun sync(): SyncResult {
+        AppLog.i("HBSync", "sync_enter waitingLock")
+        val started = System.currentTimeMillis()
+        return syncMutex.withLock {
+            AppLog.i("HBSync", "sync_begin waited=${System.currentTimeMillis() - started}ms")
+            _syncing.value = true
+            try {
+                doSync().also { _lastSyncResult.tryEmit(it) }
+            } finally {
+                _syncing.value = false
+            }
+        }
+    }
+
+    /** 本地重建每日价值（升级后启动强制重建；与同步共用互斥锁避免并发写库） */
+    override suspend fun rebuildDailyValues() {
+        AppLog.i("HBSync", "rebuild_manual_enter")
+        syncMutex.withLock {
+            syncManager.rebuildDailyValuesNow()
         }
     }
 
     private suspend fun doSync(): SyncResult {
-        // 自愈：已保存 Cookie 缺会话密钥时，从 WebView Cookie 存储补取最新值
-        val saved = credentials.cookie()
-        val cookie = if (saved.isNullOrBlank() || !saved.contains("wr_skey")) {
-            val fresh = runCatching {
-                android.webkit.CookieManager.getInstance().getCookie("https://weread.qq.com/")
-            }.getOrNull()
-            if (fresh != null && fresh.contains("wr_skey")) {
-                credentials.saveCookie(fresh)
-                fresh
-            } else {
-                saved
-            }
-        } else {
-            saved
-        }
+        // 不再从 WebView CookieManager 读 Cookie（旧"自愈"逻辑已删除）：
+        // 1) 同步（IO 线程）触碰 WebView API 会触发隐式初始化——实测在墨水屏设备上
+        //    与主线程 WebView 创建互等，导致同步卡死（点击同步无反应）与登录页白屏；
+        // 2) 与"退出登录后不复活"的目标冲突。Cookie 只来自加密存储，失效请重新扫码。
+        val cookie = credentials.cookie()
 
-        // Key 缺失但有登录态 → 自动从官方接口获取 API Key（扫码即全部授权）
+        // 先拿 Key；拿不到时优先用可解密的 Cookie 从官方接口补取（扫码即全部授权）——
+        // 顺序必须在"密文损坏判定"之前：扫码登录后 Cookie 密文必然存在，
+        // 若先判 cipherPresent 会直接报「凭证已失效」，永远走不到补取步骤
         var key = credentials.apiKey()
-        if (key == null && !cookie.isNullOrBlank()) {
-            if (credentials.fetchAndSaveApiKey(cookie)) {
-                key = credentials.apiKey()
-            }
+        if (key == null && !cookie.isNullOrBlank() && credentials.fetchAndSaveApiKey(cookie)) {
+            key = credentials.apiKey()
         }
-        if (key == null) return SyncResult.NoCredential
+        if (key == null) {
+            // 补取失败才区分：密文在但解不开 = 凭证失效（请重新扫码）；无密文 = 未登录
+            if (credentials.cipherPresent()) {
+                AppLog.w("HBSync", "cipher_present_but_broken")
+                return SyncResult.AuthFailed
+            }
+            return SyncResult.NoCredential
+        }
 
         val result = syncManager.sync(key, cookie)
+        // 无论成败都记录尝试时间：上次同步失败时 lastSyncAt 不更新，
+        // 若无尝试时间兜底，每次打开 App 都会重新触发一整轮全量同步
+        prefs.setLastSyncAttemptAt(System.currentTimeMillis())
         if (result is SyncResult.Success) {
             prefs.setLastSyncAt(System.currentTimeMillis())
         }
@@ -329,19 +393,11 @@ class BookRepositoryImpl @Inject constructor(
                     note = e.note
                 )
             }
-            val daily = dailyStatDao.getAllOnce().map { e ->
-                BackupDailyStat(
-                    date = e.date,
-                    readSeconds = e.readSeconds,
-                    valueFen = e.valueFen,
-                    bookCount = e.bookCount
-                )
-            }
+            // 每日价值不随备份导出：由同步重建生成，导入也不做恢复
             val file = BackupFile(
                 exportedAt = System.currentTimeMillis(),
                 books = books,
-                costs = costs,
-                dailyStats = daily
+                costs = costs
             )
             val json = Json { prettyPrint = true }.encodeToString(file)
             val out = context.contentResolver.openOutputStream(uri, "wt")
@@ -388,19 +444,16 @@ class BookRepositoryImpl @Inject constructor(
                     note = c.note
                 )
             })
-            // 每日统计替换
-            dailyStatDao.deleteAll()
-            dailyStatDao.upsertAll(file.dailyStats.map { d ->
-                DailyStatEntity(
-                    date = d.date,
-                    valueFen = d.valueFen,
-                    readSeconds = d.readSeconds,
-                    bookCount = d.bookCount
-                )
-            })
+            // 每日价值不随备份导入（file.dailyStats 仅兼容解析旧文件，内容忽略）：
+            // 图表只由同步重建绘制，导入不触碰 daily_stats，避免旧备份的坏数据覆盖本地正确结果
             true
         } catch (_: Exception) {
             false
         }
+    }
+
+    private companion object {
+        /** 价值重建防抖：批量操作的上百次写合并为一次重建 */
+        private const val REBUILD_DEBOUNCE_MS = 1_500L
     }
 }

@@ -25,6 +25,8 @@ import com.huibenlema.app.data.remote.ShelfSyncDto
 import com.huibenlema.app.data.remote.lng
 import com.huibenlema.app.data.remote.priceFenOrNull
 import com.huibenlema.app.data.remote.str
+import com.huibenlema.app.domain.calculator.DailyValueDelta
+import com.huibenlema.app.domain.calculator.DailyValueDistributor
 import com.huibenlema.app.domain.model.PriceSource
 import com.huibenlema.app.domain.repo.BatchPriceResult
 import com.huibenlema.app.domain.repo.BatchProgressResult
@@ -212,6 +214,8 @@ class SyncManager @Inject constructor(
             // 自导入书（33/CB_）等系统内无价的书不再每轮同步缴税
             if (!batchHandled) {
                 var failed = 0
+                var confirmedNoPrice = 0
+                var transientFailed = 0
                 for ((idx, b) in unpriced.withIndex()) {
                     tracker.update(15 + (idx + 1) * 35 / unpriced.size, "获取书籍价格 ${idx + 1}/${unpriced.size}")
                     val cached = priceCacheDao.getValid(b.bookId, now)
@@ -222,17 +226,27 @@ class SyncManager @Inject constructor(
                     if (idx > 0) delay(PRICE_FETCH_THROTTLE_MS)
                     // 每批之间额外休息，降低连续请求触发风控的概率
                     if (idx > 0 && idx % PRICE_BATCH_SIZE == 0) delay(PRICE_BATCH_PAUSE_MS)
-                    val fen = fetchPriceFenViaPrivate(b.bookId, cookie)
-                    if (fen == null) {
+                    val meta = fetchPrivateMeta(b.bookId, cookie)
+                    if (meta.priceFen == null) {
                         failed++
-                        cachePrice(b.bookId, 0L, now) // 负缓存：失败/无价 24h 内不再重试
+                        if (meta.responseOk) {
+                            confirmedNoPrice++
+                            cachePrice(b.bookId, 0L, now) // 仅确认无价才负缓存
+                        } else {
+                            transientFailed++
+                        }
                         continue
                     }
-                    pendingPrices += b.bookId to fen
-                    cachePrice(b.bookId, fen, now)
+                    pendingPrices += b.bookId to meta.priceFen
+                    cachePrice(b.bookId, meta.priceFen, now)
                 }
-                if (failed > 0 && pendingPrices.isEmpty()) {
+                if (failed > 0) {
                     priceWarning = "仍有 ${failed} 本未能获取官方价格，可手动补录"
+                    AppLog.w(
+                        "HBSync",
+                        "price_fetch_partial failed=$failed " +
+                            "noPrice=$confirmedNoPrice transient=$transientFailed"
+                    )
                 }
             }
             // 批量落库（单事务，避免逐本写触发数据库通知风暴）
@@ -672,13 +686,19 @@ class SyncManager @Inject constructor(
     private suspend fun fetchPrivateMeta(bookId: String, cookie: String): PrivateBookMeta {
         val web = runCatching { privateApi.webBookInfo(bookId, cookie, REFERER) }.getOrNull()
         if (web != null && web.lng("errcode") == 0L && web.lng("errCode") == 0L) {
-            return PrivateBookMeta(web.priceFenOrNull()?.takeIf { it > 0 }, web.pickAuthor())
+            val price = web.priceFenOrNull()?.takeIf { it > 0 }
+            if (price != null) return PrivateBookMeta(price, web.pickAuthor(), responseOk = true)
+            // 网页版成功但无价格时继续子域兜底，避免把字段缺失误判为确认无价
         }
         val sub = runCatching { privateApi.bookInfo(bookId, cookie) }.getOrNull()
         if (sub != null && sub.lng("errcode") == 0L) {
-            return PrivateBookMeta(sub.priceFenOrNull()?.takeIf { it > 0 }, sub.pickAuthor())
+            return PrivateBookMeta(
+                sub.priceFenOrNull()?.takeIf { it > 0 },
+                sub.pickAuthor(),
+                responseOk = true
+            )
         }
-        return PrivateBookMeta(null, "")
+        return PrivateBookMeta(null, "", responseOk = false)
     }
 
     /** 作者字段可能在顶层，也可能包在 data 层（网页版/子域结构不完全一致） */
@@ -825,6 +845,7 @@ class SyncManager @Inject constructor(
         now: Long
     ) {
         val pending = mutableListOf<PendingLongestBook>()
+        var progressFailedCount = 0
         suspend fun flushPending() {
             if (pending.isEmpty()) return
             db.withTransaction {
@@ -871,6 +892,11 @@ class SyncManager @Inject constructor(
             )
             // 限流时退避重试一次；单本失败不影响其他；UpgradeRequired 向上抛出
             val progress = fetchProgressResilient(key, lb.bookId).progress
+            if (progress == null) {
+                // 进度失败时不能先落书籍主记录：默认 0 进度会让后续同步判重跳过，导致永远无法重试
+                progressFailedCount++
+                continue
+            }
             // 作者走官方 /book/info（官方通道更稳，替代私有通道）；价格仍走私有通道（官方无价格）。
             // 官方接口失败只丢作者不影响主流程，skill 升级信号照常向上抛出
             var author = ""
@@ -890,6 +916,9 @@ class SyncManager @Inject constructor(
             }
         }
         flushPending()
+        if (progressFailedCount > 0) {
+            AppLog.w("HBSync", "longest_book_progress_skip count=$progressFailedCount")
+        }
     }
 
     /** 补捞书待落库数据（网络逐本获取，落库批量执行） */
@@ -941,20 +970,28 @@ class SyncManager @Inject constructor(
             val sparse = rows.size <= 1
             var prevProgress = 0.0
             var prevDate = window
+            // 首个产生 Δ 的段 = 最早快照日之前的全部历史价值：产生于记账开始之前，
+            // 没有任何快照能定位它，一律按阅读秒数摊薄——否则快照历史中断的用户
+            // （清数据/重装后快照重新积累）会出现「阅读时间少但价值高」的大柱
+            var isFirstValue = true
             for (row in rows) {
                 val delta = row.progress - prevProgress
                 if (delta > 0) {
                     val rowDate = LocalDate.parse(row.date)
-                    distribute(
-                        ValueDelta(
+                    DailyValueDistributor.distribute(
+                        DailyValueDelta(
                             bookId = b.bookId,
                             valueFen = (delta * b.priceFen).toLong(),
                             fromDate = maxOf(prevDate.plusDays(1), window),
                             endDate = rowDate // 该段真实快照日（不再错误归到今天）
                         ),
                         dailySecMap, ::add,
-                        spreadBySeconds = sparse
+                        spreadBySeconds = DailyValueDistributor.shouldSpreadBySeconds(
+                            snapshotCount = rows.size,
+                            isFirstValue = isFirstValue
+                        )
                     )
+                    isFirstValue = false
                 }
                 prevProgress = row.progress
                 prevDate = LocalDate.parse(row.date)
@@ -962,8 +999,8 @@ class SyncManager @Inject constructor(
             // 尾段：最后一次快照到当前最新进度（段尾就是今天）
             val tail = b.progress - prevProgress
             if (tail > 0) {
-                distribute(
-                    ValueDelta(
+                DailyValueDistributor.distribute(
+                    DailyValueDelta(
                         bookId = b.bookId,
                         valueFen = (tail * b.priceFen).toLong(),
                         fromDate = maxOf(prevDate.plusDays(1), window),
@@ -995,87 +1032,23 @@ class SyncManager @Inject constructor(
                 }
             )
         }
+        val topDays = dayValue.entries
+            .sortedWith(compareByDescending<Map.Entry<String, Long>> { it.value }.thenBy { it.key })
+            .take(REBUILD_TOP_DAYS_LOG_COUNT)
+            .joinToString(prefix = "[", postfix = "]") { (date, valueFen) ->
+                "date=$date,valueFen=$valueFen," +
+                    "readSeconds=${dailySecMap[date] ?: 0L},bookCount=${dayCount[date] ?: 0}"
+            }
         AppLog.i("HBSync", "rebuild_result totalValueFen=${dayValue.values.sum()} dayRows=${dayValue.size}")
+        AppLog.i("HBSync", "rebuild_top_days top=$topDays")
     }
 
-    /**
-     * 把一本书的 Δ价值分布到 (fromDate, endDate]：
-     * - 区间 ≤ 7 天：按每日阅读秒数加权分摊（频繁同步时平滑）
-     * - 区间 > 7 天：
-     *   - spreadBySeconds=true（该书历史快照稀疏 ≤1 行，无法按快照段定位历史进度）：
-     *     最近 [SPREAD_DAYS] 天（图表可见范围）按账号级阅读秒数加权分布，更早部分归 endDate——
-     *     保证"有阅读的日子"都有柱子，价值不会全堆在某一天
-     *   - 否则整段归 endDate（该段的快照日），避免价值摊到没读该书的日期。
-     *   endDate 为该段真实的快照日——曾错误使用"本次同步日"（today），
-     *   导致长间隔同步时所有历史段价值全部堆到同步当天、历史日期价值为 0。
-     * 纯函数：读秒数查内存映射，结果经 [add] 回调聚合（不再逐条访问数据库）。
-     */
-    private fun distribute(
-        v: ValueDelta,
-        dailySecMap: Map<String, Long>,
-        add: (LocalDate, Long, String) -> Unit,
-        spreadBySeconds: Boolean = false
-    ) {
-        val days = mutableListOf<LocalDate>()
-        var d = v.fromDate
-        while (!d.isAfter(v.endDate)) {
-            days += d
-            d = d.plusDays(1)
-        }
-        if (days.size > 7) {
-            if (!spreadBySeconds) {
-                add(v.endDate, v.valueFen, v.bookId)
-                return
-            }
-            // 稀疏快照：最近 SPREAD_DAYS 天内按秒数加权，更早的部分归 endDate
-            val recent = days.takeLast(SPREAD_DAYS)
-            val recentSec = recent.sumOf { dailySecMap[it.toString()] ?: 0L }
-            if (recentSec <= 0) {
-                add(v.endDate, v.valueFen, v.bookId)
-                return
-            }
-            var allocated = 0L
-            for (day in recent) {
-                val sec = dailySecMap[day.toString()] ?: 0L
-                if (sec <= 0) continue
-                val part = v.valueFen * sec / recentSec
-                if (part > 0) {
-                    add(day, part, v.bookId)
-                    allocated += part
-                }
-            }
-            val remainder = v.valueFen - allocated
-            if (remainder > 0) add(v.endDate, remainder, v.bookId)
-            return
-        }
-        val totalSec = days.sumOf { dailySecMap[it.toString()] ?: 0L }
-        if (totalSec <= 0) {
-            add(v.endDate, v.valueFen, v.bookId)
-            return
-        }
-        var allocated = 0L
-        for (day in days) {
-            val sec = dailySecMap[day.toString()] ?: 0L
-            if (sec <= 0) continue
-            val part = v.valueFen * sec / totalSec
-            if (part > 0) {
-                add(day, part, v.bookId)
-                allocated += part
-            }
-        }
-        val remainder = v.valueFen - allocated
-        if (remainder > 0) add(v.endDate, remainder, v.bookId)
-    }
-
-    private data class ValueDelta(
-        val bookId: String,
-        val valueFen: Long,
-        val fromDate: LocalDate,
-        /** 该价值段对应的快照日（>7 天段/无秒数段/余数都归到这一天） */
-        val endDate: LocalDate
+    private data class PrivateBookMeta(
+        val priceFen: Long?,
+        val author: String,
+        /** 接口成功返回且无正价才可视为确认无价；请求失败只当临时失败 */
+        val responseOk: Boolean
     )
-
-    private data class PrivateBookMeta(val priceFen: Long?, val author: String)
 
     /** 重建重放窗口起点（回溯 145 个月） */
     private fun windowStart(today: LocalDate): LocalDate = today.minusMonths(BACKFILL_MONTHS + 1L)
@@ -1108,7 +1081,7 @@ class SyncManager @Inject constructor(
         private const val EMPTY_MONTHS_LIMIT = 6
         /** 网页版接口 Referer */
         private const val REFERER = "https://weread.qq.com/"
-        /** 稀疏快照书长段价值按秒数分布的最近天数（图表可见范围 30 天） */
-        private const val SPREAD_DAYS = 30
+        /** rebuild_top_days 埋点输出的高价值日期数量 */
+        private const val REBUILD_TOP_DAYS_LOG_COUNT = 10
     }
 }

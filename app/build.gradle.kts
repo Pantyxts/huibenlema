@@ -14,6 +14,7 @@ val keystoreProps = Properties().apply {
     val f = rootProject.file("keystore.properties")
     if (f.exists()) f.inputStream().use { load(it) }
 }
+val releaseStoreFile = keystoreProps.getProperty("storeFile")
 
 android {
     namespace = "com.huibenlema.app"
@@ -25,10 +26,10 @@ android {
         minSdk = 23
         targetSdk = 35
         versionCode = 1
-        versionName = "2.0.2"
+        versionName = "2.0.3"
     }
 
-    // 双变体：eink = 墨水屏版（先做），universal = 通用手机版（阶段 3）
+    // 单变体：eink = 墨水屏版
     flavorDimensions += "target"
     productFlavors {
         create("eink") {
@@ -37,32 +38,27 @@ android {
             targetSdk = 28
             // ⚠️ 每次发版必须递增！Android 按 versionCode 判断"已安装该版本"
             // （beta 迭代同样递增：SmartOS 对相同 versionCode 的覆盖安装会拒绝）
-            versionCode = 101062
+            versionCode = 101067
             ndk {
                 abiFilters += listOf("arm64-v8a", "armeabi-v7a")
-            }
-        }
-        create("universal") {
-            dimension = "target"
-            targetSdk = 35
-            ndk {
-                abiFilters += "arm64-v8a"
             }
         }
     }
 
     signingConfigs {
-        create("release") {
-            storeFile = rootProject.file(keystoreProps.getProperty("storeFile"))
-            storePassword = keystoreProps.getProperty("storePassword")
-            keyAlias = keystoreProps.getProperty("keyAlias")
-            keyPassword = keystoreProps.getProperty("keyPassword")
+        if (releaseStoreFile != null) {
+            create("release") {
+                storeFile = rootProject.file(releaseStoreFile)
+                storePassword = keystoreProps.getProperty("storePassword")
+                keyAlias = keystoreProps.getProperty("keyAlias")
+                keyPassword = keystoreProps.getProperty("keyPassword")
+            }
         }
     }
 
     buildTypes {
         release {
-            signingConfig = signingConfigs.getByName("release")
+            if (releaseStoreFile != null) signingConfig = signingConfigs.getByName("release")
             isMinifyEnabled = true
             isShrinkResources = true
             proguardFiles(

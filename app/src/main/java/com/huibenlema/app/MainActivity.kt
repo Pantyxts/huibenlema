@@ -12,7 +12,7 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContent {
-            // 阶段 3：universal 彩色主题在此按 flavor 分支
+            // 墨水屏专用黑白主题
             EinkTheme {
                 AppRoot()
             }

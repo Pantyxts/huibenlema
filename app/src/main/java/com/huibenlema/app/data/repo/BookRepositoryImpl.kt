@@ -7,6 +7,7 @@ import com.huibenlema.app.data.local.dao.BookDao
 import com.huibenlema.app.data.local.dao.CostItemDao
 import com.huibenlema.app.data.local.dao.DailyBookStatDao
 import com.huibenlema.app.data.local.dao.DailyStatDao
+import com.huibenlema.app.data.local.dao.PriceCacheDao
 import com.huibenlema.app.data.local.toDomain
 import com.huibenlema.app.data.local.toEntity
 import com.huibenlema.app.data.log.AppLog
@@ -66,6 +67,7 @@ class BookRepositoryImpl @Inject constructor(
     private val costItemDao: CostItemDao,
     private val dailyStatDao: DailyStatDao,
     private val dailyBookStatDao: DailyBookStatDao,
+    private val priceCacheDao: PriceCacheDao,
     private val syncManager: SyncManager,
     private val credentials: CredentialsManager,
     private val prefs: UserPrefs,
@@ -333,6 +335,10 @@ class BookRepositoryImpl @Inject constructor(
         syncMutex.withLock {
             syncManager.rebuildDailyValuesNow()
         }
+    }
+
+    override suspend fun invalidateFailedPriceCache() {
+        priceCacheDao.deleteZeroPrices()
     }
 
     private suspend fun doSync(): SyncResult {

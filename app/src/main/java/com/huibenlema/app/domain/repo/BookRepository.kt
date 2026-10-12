@@ -190,6 +190,9 @@ interface BookRepository {
     /** 本地重建每日价值（升级后强制重建用；与同步共用互斥锁） */
     suspend fun rebuildDailyValues()
 
+    /** 清理旧的失败负缓存（确认无价仍由下次同步重新写入） */
+    suspend fun invalidateFailedPriceCache()
+
     /** 数据导出：书籍 + 成本台账 + 每日统计 → JSON 写入目标 Uri；凭证不导出 */
     suspend fun exportData(uri: Uri): Boolean
 

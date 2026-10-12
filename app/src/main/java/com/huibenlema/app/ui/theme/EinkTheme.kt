@@ -65,7 +65,7 @@ private object NoIndication : IndicationNodeFactory {
 
 /**
  * 墨水屏主题：黑白高对比、全局禁用点击涟漪（避免残影）。
- * 阶段 3 的 universal 彩色主题按 flavor 分支，不影响此文件。
+ * 当前应用仅保留墨水屏专用主题。
  */
 @Composable
 fun EinkTheme(content: @Composable () -> Unit) {

@@ -30,7 +30,6 @@ class UserPrefs @Inject constructor(@ApplicationContext private val context: Con
         val CREDENTIAL_UPDATED_AT = longPreferencesKey("credential_updated_at")
         val LAST_SYNC_AT = longPreferencesKey("last_sync_at")
         val LAST_SYNC_ATTEMPT_AT = longPreferencesKey("last_sync_attempt_at")
-        val WIFI_ONLY = booleanPreferencesKey("wifi_only")
         val ONBOARDING_DONE = booleanPreferencesKey("onboarding_done")
         val AUTO_SYNC = booleanPreferencesKey("auto_sync")
         val REGIST_TIME = longPreferencesKey("regist_time")
@@ -49,7 +48,6 @@ class UserPrefs @Inject constructor(@ApplicationContext private val context: Con
     val lastSyncAt: Flow<Long> = context.dataStore.data.map { it[Keys.LAST_SYNC_AT] ?: 0L }
     /** 最近一次同步尝试时间（成败都记）：自动同步节流用，失败后不更新 lastSyncAt 也能冷却 */
     val lastSyncAttemptAt: Flow<Long> = context.dataStore.data.map { it[Keys.LAST_SYNC_ATTEMPT_AT] ?: 0L }
-    val wifiOnly: Flow<Boolean> = context.dataStore.data.map { it[Keys.WIFI_ONLY] ?: true }
     val onboardingDone: Flow<Boolean> = context.dataStore.data.map { it[Keys.ONBOARDING_DONE] ?: false }
     /** 自动同步默认开启（老用户升级即获得启动同步 + 24h 定时；显式关闭过的用户不受影响） */
     val autoSync: Flow<Boolean> = context.dataStore.data.map { it[Keys.AUTO_SYNC] ?: true }
@@ -86,10 +84,6 @@ class UserPrefs @Inject constructor(@ApplicationContext private val context: Con
 
     suspend fun setLastSyncAttemptAt(value: Long) {
         context.dataStore.edit { it[Keys.LAST_SYNC_ATTEMPT_AT] = value }
-    }
-
-    suspend fun setWifiOnly(value: Boolean) {
-        context.dataStore.edit { it[Keys.WIFI_ONLY] = value }
     }
 
     suspend fun setOnboardingDone(value: Boolean) {

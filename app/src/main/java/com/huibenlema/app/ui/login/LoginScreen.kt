@@ -56,7 +56,7 @@ fun LoginScreen(
 ) {
     val state by vm.state.collectAsStateWithLifecycle()
     val alreadyLoggedState by vm.alreadyLogged.collectAsStateWithLifecycle()
-    var forceRelogin by remember { mutableStateOf(false) }
+    val reloginClearingState by vm.reloginClearing.collectAsStateWithLifecycle()
     var webViewKey by remember { mutableStateOf(0) }
 
     // 进入时重置上次的登录成功状态（防止残留导致闪退循环）
@@ -78,8 +78,9 @@ fun LoginScreen(
         }
     }
 
-    if (!forceRelogin && alreadyLoggedState) {
-        // 已登录状态页（判定数据源 = 加密存储的 Cookie 可解密，不再读 WebView Cookie 库）
+    if (alreadyLoggedState || reloginClearingState) {
+        // 已登录状态页（判定数据源 = 加密存储的 Cookie 可解密，不再读 WebView Cookie 库）。
+        // 重新登录清理期间继续保持本页：必须等 Cookie/localStorage 删除完成后才创建 WebView。
         Column(
             Modifier
                 .fillMaxSize()
@@ -88,7 +89,10 @@ fun LoginScreen(
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.Center
         ) {
-            Text("当前已处于微信读书登录状态", style = MaterialTheme.typography.titleLarge)
+            Text(
+                if (reloginClearingState) "正在退出网页登录…" else "当前已处于微信读书登录状态",
+                style = MaterialTheme.typography.titleLarge
+            )
             Spacer(Modifier.height(8.dp))
             Text(
                 "同步时会自动补全书价，无需重复登录",
@@ -97,11 +101,9 @@ fun LoginScreen(
             )
             Spacer(Modifier.height(20.dp))
             EinkButton(
-                text = "退出并重新登录",
-                onClick = {
-                    forceRelogin = true
-                    vm.relogin()
-                },
+                text = if (reloginClearingState) "正在清理登录状态…" else "退出并重新登录",
+                onClick = vm::relogin,
+                enabled = !reloginClearingState,
                 modifier = Modifier.fillMaxWidth()
             )
             Spacer(Modifier.height(8.dp))
@@ -215,15 +217,25 @@ private fun WebViewArea(vm: LoginViewModel, webViewKey: Int) {
         val t0 = System.currentTimeMillis()
         runCatching {
             WebView(context).apply {
+                // 重新登录/退出后防止 HTTP 缓存复用旧登录页；Cookie/localStorage 已在此前清理完成。
+                clearCache(true)
+                clearHistory()
                 settings.javaScriptEnabled = true
                 settings.domStorageEnabled = true
                 settings.userAgentString = QrLoginJs.MOBILE_UA
                 // 扫码登录依赖微信跨站 iframe 的 Cookie，必须开启第三方 Cookie
                 CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
                 webViewClient = object : WebViewClient() {
+                    override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
+                        super.onPageStarted(view, url, favicon)
+                        AppLog.i("HBLogin", "page_started url=$url")
+                        vm.onPageLoading()
+                    }
+
                     override fun onPageFinished(view: WebView?, url: String?) {
                         super.onPageFinished(view, url)
                         AppLog.i("HBLogin", "page_finished url=$url")
+                        vm.onPageLoading()
                         // runCatching：destroy 后迟到的回调在此注入会抛异常
                         view?.let { runCatching { it.evaluateJavascript(QrLoginJs.INIT, null) } }
                     }

@@ -1,13 +1,13 @@
 # 回本了吗
 
-纯本地、隐私优先的 Android 应用：拉取微信读书的书架与阅读进度，按书籍定价折算「已读总价值」，
+纯本地、隐私优先的墨水屏专用应用：拉取微信读书的书架与阅读进度，按书籍定价折算「已读总价值」，
 对照你的阅读设备 + 会员等成本台账，计算回本进度与每日阅读价值。
 
 小红书链接：https://www.xiaohongshu.com/discovery/item/6ac2ab0a000000001802b01f?source=webshare&xhsshare=pc_web&xsec_token=ABdgskZzYDbqA2yzfcWbT07_BjYwE9g3WKNNmw5ZEmIzQ=&xsec_source=pc_share
 
 - 应用名：回本了吗
 - 包名：`com.huibenlema.app`
-- 构建变体：`eink`（墨水屏版，先行）/ `universal`（通用手机版，阶段 3）
+- 构建变体：`eink`（墨水屏版）
 - 技术栈：Kotlin + Jetpack Compose + Retrofit + Room + DataStore + Hilt + WorkManager
 - 数据源：微信读书官方 Agent Gateway（`wrk-` API Key）为主通道，私有 API 定价通道可降级
 - 隐私：凭证 Keystore 加密、仅存本机、零上传
@@ -17,7 +17,6 @@
 ```bash
 ./gradlew :app:assembleEinkDebug       # 墨水屏 debug 版
 ./gradlew :app:assembleEinkRelease     # 墨水屏签名版（阶段 4）
-./gradlew :app:assembleUniversalDebug  # 通用 debug 版（阶段 3 起）
 ```
 
 ## 目录

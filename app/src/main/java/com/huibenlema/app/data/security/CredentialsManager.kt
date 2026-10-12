@@ -1,6 +1,7 @@
 package com.huibenlema.app.data.security
 
 import android.webkit.CookieManager
+import android.webkit.WebStorage
 import com.huibenlema.app.data.local.UserPrefs
 import com.huibenlema.app.data.log.AppLog
 import com.huibenlema.app.data.remote.PrivateWereadApi
@@ -15,9 +16,11 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flowOn
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.withContext
+import kotlin.coroutines.resume
 
 /** 凭证可用性（判定登录态的唯一依据：密文存在 ≠ 可解密） */
 enum class CredentialStatus {
@@ -124,9 +127,9 @@ class CredentialsManager @Inject constructor(
         return try {
             AppLog.i("HBCred", "apikey_get_begin")
             val body = privateApi.apiKeyGet(cookie).string()
-            AppLog.i("HBCred", "apikey_get_body body=${body.take(300)}")
+            AppLog.i("HBCred", "apikey_get_body length=${body.length}")
             val match = Regex("wrk-[A-Za-z0-9_\\-]+").find(body) ?: run {
-                AppLog.w("HBCred", "apikey_no_match body=${body.take(200)}")
+                AppLog.w("HBCred", "apikey_no_match length=${body.length}")
                 return false
             }
             saveApiKey(match.value)
@@ -150,13 +153,27 @@ class CredentialsManager @Inject constructor(
      * 否则 doSync 自愈或登录页"已登录"判定会把旧登录态读回来）。
      * 写操作在 Main 线程（WebView 权威线程），仅登出时一次。
      */
-    suspend fun clearWebViewCookies() {
-        withContext(Dispatchers.Main) {
+    suspend fun clearWebViewCookies(): Boolean {
+        val startedAt = System.currentTimeMillis()
+        val cleared = withContext(Dispatchers.Main) {
             runCatching {
-                CookieManager.getInstance().removeAllCookies {
-                    runCatching { CookieManager.getInstance().flush() }
+                // 微信读书 SPA 可能把登录态缓存在 localStorage；只清 Cookie 时页面可能仍显示已登录。
+                WebStorage.getInstance().deleteAllData()
+                suspendCancellableCoroutine { cont ->
+                    CookieManager.getInstance().removeAllCookies { removed ->
+                        runCatching { CookieManager.getInstance().flush() }
+                        if (cont.isActive) cont.resume(removed)
+                    }
                 }
-            }.onFailure { AppLog.e("HBWeb", "clear_cookies_fail", it) }
+            }.getOrElse { e ->
+                AppLog.e("HBWeb", "clear_cookies_fail", e)
+                false
+            }
         }
+        AppLog.i(
+            "HBWeb",
+            "clear_cookies_done removed=$cleared in=${System.currentTimeMillis() - startedAt}ms"
+        )
+        return cleared
     }
 }

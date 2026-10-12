@@ -54,6 +54,9 @@ class HuiBenLeMaApp : Application(), Configuration.Provider {
             val last = prefs.lastRebuildVersionCode.first()
             if (last < BuildConfig.VERSION_CODE) {
                 AppLog.i("HBApp", "upgrade_rebuild from=$last to=${BuildConfig.VERSION_CODE}")
+                // 旧版本会把“接口临时失败”写成 24h 负缓存；升级后先清掉，避免继续跳过补价
+                runCatching { repo.invalidateFailedPriceCache() }
+                    .onFailure { AppLog.e("HBApp", "price_negative_cache_clear_fail", it) }
                 runCatching { repo.rebuildDailyValues() }
                     .onFailure { AppLog.e("HBApp", "upgrade_rebuild_fail", it) }
                 prefs.setLastRebuildVersionCode(BuildConfig.VERSION_CODE)

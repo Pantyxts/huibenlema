@@ -63,14 +63,22 @@ class LoginViewModel @Inject constructor(
     private val _refreshRequests = MutableSharedFlow<QrRefreshAction>(extraBufferCapacity = 4)
     val refreshRequests: SharedFlow<QrRefreshAction> = _refreshRequests.asSharedFlow()
 
+    private val _reloginClearing = MutableStateFlow(false)
+
     /** 已登录状态页判定：Cookie 密文可解密且含 wr_skey（不再读 WebView Cookie 库） */
     val alreadyLogged: StateFlow<Boolean> = credentials.cookieOk
 
+    /** 重新登录前正在清理 WebView 登录态，防止新页面抢在 Cookie 清理完成前加载 */
+    val reloginClearing: StateFlow<Boolean> = _reloginClearing.asStateFlow()
+
     private var pollJob: Job? = null
+    private var loginTimeoutJob: Job? = null
+    private var noQrRecoveryJob: Job? = null
     private var saving = false
     private var scannedLocked = false
     private var autoRefreshCount = 0
     private var lastAutoRefreshAt = 0L
+    private var noQrReloadCount = 0
 
     /** 进入登录页：重置状态。Cookie 轮询延后到 [onWebViewReady]（见下） */
     fun enter() {
@@ -82,8 +90,13 @@ class LoginViewModel @Inject constructor(
         _state.value = LoginUiState.Loading
         pollJob?.cancel()
         pollJob = null
+        noQrReloadCount = 0
+        loginTimeoutJob?.cancel()
+        loginTimeoutJob = null
+        noQrRecoveryJob?.cancel()
+        noQrRecoveryJob = null
         // 总超时：180 秒未成功则提示手动刷新（页面不关闭）
-        viewModelScope.launch {
+        loginTimeoutJob = viewModelScope.launch {
             delay(LOGIN_TIMEOUT_MS)
             val s = _state.value
             if (s is LoginUiState.Qr || s is LoginUiState.Loading) {
@@ -102,6 +115,7 @@ class LoginViewModel @Inject constructor(
     fun onWebViewReady() {
         if (pollJob?.isActive == true) return
         AppLog.i("HBLogin", "poll_start")
+        scheduleNoQrRecovery()
         pollJob = viewModelScope.launch {
             while (isActive) {
                 delay(1_000)
@@ -119,6 +133,10 @@ class LoginViewModel @Inject constructor(
         val cur = _state.value
         if (saving || cur is LoginUiState.Success || cur is LoginUiState.Error) return
         if (scanned) scannedLocked = true
+        if (hasQr || scannedLocked) {
+            noQrRecoveryJob?.cancel()
+            noQrRecoveryJob = null
+        }
         if (scannedLocked) {
             // 已扫描锁定：永久停自动刷新，等手机确认（不顶掉可能已确认的 ticket）
             val qr = cur as? LoginUiState.Qr
@@ -158,6 +176,7 @@ class LoginViewModel @Inject constructor(
         scannedLocked = false
         autoRefreshCount = 0
         lastAutoRefreshAt = 0L
+        noQrReloadCount = 0
         _state.value = LoginUiState.Qr(hasQr = false, scanned = false, expired = false, refreshing = true)
         AppLog.i("HBLogin", "qr_refresh_manual")
         _refreshRequests.tryEmit(QrRefreshAction.RELOAD)
@@ -167,6 +186,7 @@ class LoginViewModel @Inject constructor(
     fun onWebViewCreateFailed(reason: String) {
         AppLog.e("HBLogin", "webview_create_fail reason=$reason")
         pollJob?.cancel()
+        cancelRecoveryJobs()
         _state.value = LoginUiState.Error("无法启动网页组件，请更新系统 WebView 后重试")
     }
 
@@ -174,6 +194,7 @@ class LoginViewModel @Inject constructor(
     fun onRenderProcessGone(didCrash: Boolean) {
         AppLog.e("HBLogin", "render_gone didCrash=$didCrash")
         pollJob?.cancel()
+        cancelRecoveryJobs()
         _state.value = LoginUiState.Error("登录页渲染异常，请点「重试」")
     }
 
@@ -184,17 +205,27 @@ class LoginViewModel @Inject constructor(
             code == android.webkit.WebViewClient.ERROR_CONNECT ||
             code == android.webkit.WebViewClient.ERROR_TIMEOUT
         ) {
+            cancelRecoveryJobs()
             _state.value = LoginUiState.Error("页面加载失败，请检查网络后重试")
         }
     }
 
     /** 已登录状态页的「退出并重新登录」：清 DataStore 凭证 + WebView Cookie，再进入扫码流程 */
     fun relogin() {
+        if (_reloginClearing.value) return
+        _reloginClearing.value = true
         viewModelScope.launch {
-            credentials.clearAll()
-            credentials.clearWebViewCookies()
-            AppLog.i("HBLogin", "relogin_cleared")
-            enter()
+            try {
+                credentials.clearAll()
+                val cleared = credentials.clearWebViewCookies()
+                AppLog.i("HBLogin", "relogin_cleared webview=$cleared")
+                enter()
+            } catch (e: Exception) {
+                AppLog.e("HBLogin", "relogin_clear_fail", e)
+                _state.value = LoginUiState.Error("退出网页登录失败，请重试")
+            } finally {
+                _reloginClearing.value = false
+            }
         }
     }
 
@@ -203,6 +234,62 @@ class LoginViewModel @Inject constructor(
         AppLog.i("HBLogin", "exit")
         pollJob?.cancel()
         pollJob = null
+        // 手动返回与 Cookie 轮询存在竞态：离开页前补读一次，避免扫码完成但状态尚未保存。
+        // 重新登录清理期间不能补读，否则可能把待删除的旧 Cookie 又保存回去。
+        val cookie = if (_reloginClearing.value) "" else readWereadCookie(context)
+        if (cookie.contains("wr_skey")) {
+            saveAndDone(cookie)
+        } else {
+            cancelRecoveryJobs()
+        }
+    }
+
+    /** 主文档开始/完成：重置“无二维码恢复”计时，但保留自动 reload 次数。 */
+    fun onPageLoading() {
+        scheduleNoQrRecovery()
+    }
+
+    /**
+     * 页面已加载但二维码长期未出现时，自动 reload 两次兜底。
+     * 覆盖登录模块子资源偶发失败、SPA 初始化卡住、旧版自动点击窗口太短等问题。
+     */
+    private fun scheduleNoQrRecovery() {
+        if (saving || scannedLocked || _state.value is LoginUiState.Error) return
+        noQrRecoveryJob?.cancel()
+        noQrRecoveryJob = viewModelScope.launch {
+            delay(NO_QR_RELOAD_TIMEOUT_MS)
+            if (saving || scannedLocked || _state.value is LoginUiState.Error ||
+                _state.value is LoginUiState.Success
+            ) return@launch
+            val qr = _state.value as? LoginUiState.Qr
+            if (qr != null && qr.hasQr) return@launch
+            if (noQrReloadCount >= NO_QR_RELOAD_MAX) {
+                AppLog.w("HBLogin", "qr_no_show_manual reloads=$noQrReloadCount")
+                _state.value = LoginUiState.Qr(
+                    hasQr = false,
+                    scanned = false,
+                    expired = true,
+                    refreshing = false
+                )
+                return@launch
+            }
+            noQrReloadCount++
+            AppLog.w("HBLogin", "qr_no_show_reload attempt=$noQrReloadCount")
+            _state.value = LoginUiState.Qr(
+                hasQr = false,
+                scanned = false,
+                expired = false,
+                refreshing = true
+            )
+            _refreshRequests.tryEmit(QrRefreshAction.RELOAD)
+        }
+    }
+
+    private fun cancelRecoveryJobs() {
+        loginTimeoutJob?.cancel()
+        loginTimeoutJob = null
+        noQrRecoveryJob?.cancel()
+        noQrRecoveryJob = null
     }
 
     /** 幂等保存 + API Key 后台补取（不阻塞登录完成；失败下次同步 doSync 会自动补） */
@@ -210,6 +297,8 @@ class LoginViewModel @Inject constructor(
         if (saving || _state.value is LoginUiState.Success) return
         saving = true
         pollJob?.cancel()
+        noQrRecoveryJob?.cancel()
+        noQrRecoveryJob = null
         viewModelScope.launch {
             _state.value = LoginUiState.Saving
             AppLog.i("HBLogin", "cookie_detected wr_skey=1")
@@ -241,6 +330,10 @@ class LoginViewModel @Inject constructor(
 
         /** 登录总超时 */
         private const val LOGIN_TIMEOUT_MS = 180_000L
+        /** 页面加载后无二维码的自动整页恢复等待 */
+        private const val NO_QR_RELOAD_TIMEOUT_MS = 20_000L
+        /** 无二维码自动 reload 上限，之后保留页面并提示手动刷新 */
+        private const val NO_QR_RELOAD_MAX = 2
     }
 }
 

@@ -4,7 +4,7 @@ package com.huibenlema.app.data.remote
 sealed class GatewayResult<out T> {
     data class Ok<T>(val data: T) : GatewayResult<T>()
     data class Err(val errcode: Int, val message: String) : GatewayResult<Nothing>()
-    /** 官方 skill 版本升级提示（SKILL.md 要求必须暂停并提示用户） */
+    /** 兼容旧官方语义的升级中断结果；当前 upgrade_info 已改为非阻塞提示 */
     data class UpgradeRequired(val message: String) : GatewayResult<Nothing>()
 }
 

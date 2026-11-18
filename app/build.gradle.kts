@@ -26,7 +26,7 @@ android {
         minSdk = 23
         targetSdk = 35
         versionCode = 1
-        versionName = "2.0.3"
+        versionName = "2.0.5"
     }
 
     // 单变体：eink = 墨水屏版
@@ -38,7 +38,7 @@ android {
             targetSdk = 28
             // ⚠️ 每次发版必须递增！Android 按 versionCode 判断"已安装该版本"
             // （beta 迭代同样递增：SmartOS 对相同 versionCode 的覆盖安装会拒绝）
-            versionCode = 101067
+            versionCode = 101069
             ndk {
                 abiFilters += listOf("arm64-v8a", "armeabi-v7a")
             }

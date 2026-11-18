@@ -225,9 +225,9 @@ class OfficialGatewayClient @Inject constructor(
             val resp = api.call("Bearer $key", body)
             val upgrade = resp["upgrade_info"] as? JsonObject
             if (upgrade != null) {
-                // 记录完整升级信息（官方新 skill 版本号/下载地址），供排障与更新 SKILL_VERSION
+                // 官方 v1.0.6 起 upgrade_info 是非阻塞提示：同一回包仍带 errcode/业务数据。
+                // 只记录升级信息供排障与后续发版，不中断当前同步。
                 AppLog.i("HBWeb", "upgrade_info=$upgrade")
-                return GatewayResult.UpgradeRequired(upgrade.str("message").ifBlank { "微信读书 Skill 版本已升级" })
             }
             val errcode = resp.lng("errcode")
             if (errcode != 0L) {
@@ -249,8 +249,8 @@ class OfficialGatewayClient @Inject constructor(
     }
 
     companion object {
-        /** 官方 Skill 包版本（v1.0.4）；请求必带 */
-        const val SKILL_VERSION = "1.0.5"
+        /** 官方 Skill 包版本；请求必带 */
+        const val SKILL_VERSION = "1.0.6"
 
         /** notebooks 分页翻页上限（每页 100 本，防游标异常死循环） */
         private const val MAX_NOTEBOOK_PAGES = 50
